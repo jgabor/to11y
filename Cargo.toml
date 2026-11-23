@@ -1,0 +1,38 @@
+[package]
+name = "to11y"
+version = "0.1.0-rc.1"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "Subscription usage limits, pacing, and reset times for coding agents, over MCP"
+repository = "https://github.com/jgabor/to11y"
+readme = "README.md"
+keywords = ["mcp", "claude-code", "codex", "rate-limit", "usage"]
+categories = ["command-line-utilities", "development-tools"]
+include = ["/src", "/README.md", "/LICENSE"]
+
+[dependencies]
+# Decrypts Droid's stored login. Factory uses a 16-byte nonce, which
+# graviola's AES-GCM doesn't take.
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+rustls-graviola = "0.4"
+serde_json = "1"
+webpki-roots = "1"
+
+[lints.cargo]
+unused_dependencies = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[dev-dependencies]
+# Oracles for code we wrote ourselves. None of them ships in the binary.
+base64 = "0.23"
+httparse = "1"
+jiff = "1"
+zbus = { version = "6", default-features = false, features = ["tokio", "service"] }
+rmcp = { version = "3.11", default-features = false, features = ["client", "transport-child-process"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process"] }

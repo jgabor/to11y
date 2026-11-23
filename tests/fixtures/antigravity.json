@@ -1,0 +1,60 @@
+{
+ "groups": [
+  {
+   "displayName": "Gemini Models",
+   "description": "Models within this group: Gemini 4 Neon, Gemini 4 Hydrogen, Gemini 3.8 Flash",
+   "buckets": [
+    {
+     "bucketId": "gemini-weekly",
+     "displayName": "Weekly Limit Remaining",
+     "window": "weekly",
+     "resetTime": "2026-11-28T15:34:08Z",
+     "description": "You have hit your weekly limit, it refreshes in 5 days, 1 hour. If on a supported paid plan, you can use AI credits in the interim or upgrade to a higher tier.",
+     "remainingFraction": 0
+    },
+    {
+     "bucketId": "gemini-5h",
+     "displayName": "Five Hour Limit Remaining",
+     "window": "5h",
+     "resetTime": "2026-11-23T15:27:47Z",
+     "description": "You have hit your weekly limit, the 5-hour limit does not currently apply. Your weekly limit will fully refresh in 5 days, 1 hour.",
+     "disabled": true,
+     "remainingFraction": 0.99993336
+    }
+   ]
+  },
+  {
+   "displayName": "Claude and GPT models",
+   "description": "Models within this group: Claude Opus 5.5, Claude Sonnet 5.5, GPT-OSS 120B",
+   "buckets": [
+    {
+     "bucketId": "3p-weekly",
+     "displayName": "Weekly Limit Remaining",
+     "window": "weekly",
+     "resetTime": "2026-11-30T12:00:00Z",
+     "remainingFraction": 0.97
+    },
+    {
+     "bucketId": "3p-5h",
+     "displayName": "Five Hour Limit Remaining",
+     "window": "5h",
+     "resetTime": "2026-11-23T17:02:40Z",
+     "remainingFraction": 0.82
+    }
+   ]
+  },
+  {
+   "displayName": "Gemini 4 Argon",
+   "description": "For paid Pro plans, Argon quota is separate.",
+   "buckets": [
+    {
+     "bucketId": "gemini-argon-weekly",
+     "displayName": "Gemini 4 Argon Weekly Limit",
+     "window": "weekly",
+     "resetTime": "2026-11-30T14:31:10Z",
+     "remainingFraction": 1
+    }
+   ]
+  }
+ ]
+}
