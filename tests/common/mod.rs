@@ -14,6 +14,7 @@ pub const NOW: &str = "2026-11-23T14:31:10Z";
 pub struct Sandbox {
     root: PathBuf,
     fixtures: PathBuf,
+    claude_session: Option<String>,
 }
 
 impl Sandbox {
@@ -24,7 +25,19 @@ impl Sandbox {
         Sandbox {
             root,
             fixtures: PathBuf::from(FIXTURES),
+            claude_session: None,
         }
+    }
+
+    /// Puts the fixture logs for all four harnesses in the home directory,
+    /// and runs as Claude Code session `session`.
+    pub fn with_logs(mut self, session: &str) -> Self {
+        copy_dir(
+            &Path::new(FIXTURES).join("logs/home"),
+            &self.root.join("home"),
+        );
+        self.claude_session = Some(session.to_owned());
+        self
     }
 
     /// Serves fixtures from a copy that the test can change.
@@ -33,7 +46,9 @@ impl Sandbox {
         std::fs::create_dir_all(&dir).unwrap();
         for entry in std::fs::read_dir(FIXTURES).unwrap() {
             let entry = entry.unwrap();
-            std::fs::copy(entry.path(), dir.join(entry.file_name())).unwrap();
+            if entry.file_type().unwrap().is_file() {
+                std::fs::copy(entry.path(), dir.join(entry.file_name())).unwrap();
+            }
         }
         self.fixtures = dir;
         self
@@ -49,12 +64,16 @@ impl Sandbox {
 
     /// The environment the binary runs with, and nothing else.
     pub fn vars(&self) -> Vec<(&'static str, PathBuf)> {
-        vec![
+        let mut vars = vec![
             ("HOME", self.root.join("home")),
             ("XDG_CACHE_HOME", self.root.join("cache")),
             ("TO11Y_FIXTURES", self.fixtures.clone()),
             ("TO11Y_NOW", PathBuf::from(NOW)),
-        ]
+        ];
+        if let Some(session) = &self.claude_session {
+            vars.push(("CLAUDE_CODE_SESSION_ID", PathBuf::from(session)));
+        }
+        vars
     }
 
     pub fn std_command(&self) -> std::process::Command {
@@ -67,6 +86,19 @@ impl Sandbox {
         let mut command = tokio::process::Command::new(BIN);
         command.env_clear().envs(self.vars());
         command
+    }
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).unwrap();
+        }
     }
 }
 

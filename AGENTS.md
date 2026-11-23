@@ -1,9 +1,9 @@
 # to11y
 
-An MCP server over stdio that reports subscription usage limits, pacing, and
-reset times for Claude Code, Codex, Droid, and Antigravity. One binary crate,
-no async runtime, no persistent database. `README.md` states the intent and
-the budgets.
+An MCP server over stdio that reports subscription usage limits, pacing,
+reset times, and token usage from local logs for Claude Code, Codex, Droid,
+and Antigravity. One binary crate, no async runtime, no persistent database.
+`README.md` states the intent and the budgets.
 
 ## Layout
 
@@ -11,7 +11,7 @@ the budgets.
 |---|---|
 | `src/main.rs` | Arguments, then the server on stdin and stdout |
 | `src/mcp.rs` | JSON-RPC framing, the legacy `initialize` lifecycle, and 2026-07-28 |
-| `src/tools.rs` | The ten tools, harness detection, result shapes |
+| `src/tools.rs` | The seventeen tools, their arguments, harness detection, result shapes |
 | `src/model.rs` | `Harness`, `Window`, `Snapshot`, `Credits`, `Unavailable` |
 | `src/pace.rs` | Pacing and scope rollups, pure functions of a window and `now` |
 | `src/cache.rs` | The per-harness file cache, single flight, last good reading |
@@ -20,9 +20,14 @@ the budgets.
 | `src/http.rs` | HTTPS over HTTP/1.1 with rustls |
 | `src/dbus.rs` | The Secret Service lookup over D-Bus |
 | `src/base64.rs`, `src/time.rs` | Base64 decoding, RFC 3339 and durations |
+| `src/tokens/mod.rs` | `Tokens`, `Event`, `Period`, the parallel log scan and dedupe |
+| `src/tokens/<harness>.rs` | One module per harness: `files(env)` and a pure `parse(reader, path)` |
+| `src/tokens/report.rs` | The JSON of each token tool, project names, scope to model |
 | `src/env.rs` | The environment, read once at startup |
 | `tests/mcp.rs` | The built binary driven by rmcp's client and by raw transcripts |
 | `tests/fixtures/` | Redacted real provider answers, captured at 2026-11-23T14:31:10Z |
+| `tests/fixtures/logs/home/` | Synthetic logs for all four harnesses, with planted ids |
+| `scripts/oracle_tokens.py` | `just oracle-tokens`: token totals on real logs against ccusage |
 
 ## Commands
 
@@ -30,6 +35,8 @@ the budgets.
   `cargo clippy --all-targets --locked -- -D warnings`, and
   `cargo test --locked`.
 - Oldest supported Rust: `just msrv`.
+- After changing a log parser: `just oracle-tokens <ccusage binary>` on real
+  logs. It must pass for 7 and 30 days.
 - The tests need `dbus-daemon` on `PATH`.
 
 ## Hard rules
@@ -44,6 +51,9 @@ the budgets.
 - No token or account identifier is ever printed, logged, cached, or put in a
   tool result. Parsers drop identifiers. `Failed` names a status or an error
   kind, never a response body. Keep tokens in `creds::Secret`.
+- Log parsers keep only usage fields, times, models, and folders. Session
+  ids never leave the process, and no tool result or log line names a file
+  path or quotes message text.
 - Never trigger a keyring unlock prompt. A locked item is `KeyringLocked`.
 - Only MCP messages go to stdout, one per line. Logs go to stderr.
 - `TO11Y_NOW` and `TO11Y_FIXTURES` are read only in debug builds. Release

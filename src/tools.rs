@@ -15,91 +15,183 @@ use crate::model::{Harness, Snapshot, Unavailable};
 use crate::pace::{self, Assessed, Scope, Verdict};
 use crate::providers::{self, Context};
 use crate::time;
+use crate::tokens::{Period, report};
 
-/// Name, description, and whether the tool takes a `harness`.
-const TOOLS: [(&str, &str, bool); 10] = [
-    (
-        "usage_limits",
-        "Show a coding agent's subscription usage limits: percent used, time to reset, and pace for each 5-hour, weekly, or monthly window.",
-        true,
-    ),
-    (
-        "usage_pace",
-        "Check whether subscription quota is being used too fast: percent used against percent of the window elapsed, with a safe hourly rate.",
-        true,
-    ),
-    (
-        "usage_forecast",
-        "Forecast whether a subscription usage limit will run out before it resets, and when, at the current rate of use.",
-        true,
-    ),
-    (
-        "usage_reset_times",
-        "List when each subscription usage limit window resets, as a timestamp and as time remaining.",
-        true,
-    ),
-    (
-        "usage_remaining_quota",
-        "Show how much subscription quota is left in each usage window, and the tightest limit for each model group or pool.",
-        true,
-    ),
-    (
-        "rate_limit_status",
-        "Check whether a coding agent is rate limited right now because a usage limit is used up, and until when.",
-        true,
-    ),
-    (
-        "usage_extra_credits",
-        "Show extra usage, overage, or credit balance beyond the limits included in a subscription.",
-        true,
-    ),
-    (
-        "subscription_plan",
-        "Show which subscription plan and tier a coding agent's account is on.",
-        true,
-    ),
-    (
-        "usage_limits_all_harnesses",
-        "Compare subscription usage limits across Claude Code, Codex, Droid, and Antigravity to find which coding agent has headroom left.",
-        false,
-    ),
-    (
-        "usage_login_status",
-        "Explain why subscription usage data is missing or stale: sign-in, keyring, and last check for a coding agent.",
-        true,
-    ),
+/// What a tool takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Args {
+    None,
+    Harness,
+    HarnessPeriod,
+    Period,
+}
+
+impl Args {
+    fn harness(self) -> bool {
+        matches!(self, Args::Harness | Args::HarnessPeriod)
+    }
+
+    fn period(self) -> bool {
+        matches!(self, Args::HarnessPeriod | Args::Period)
+    }
+}
+
+struct Tool {
+    name: &'static str,
+    description: &'static str,
+    args: Args,
+    /// Reads only local files, with no call to a provider.
+    local: bool,
+}
+
+const TOOLS: [Tool; 17] = [
+    Tool {
+        name: "usage_limits",
+        description: "Show a coding agent's subscription usage limits: percent used, time to reset, and pace for each 5-hour, weekly, or monthly window.",
+        args: Args::Harness,
+        local: false,
+    },
+    Tool {
+        name: "usage_pace",
+        description: "Check whether subscription quota is being used too fast: percent used against percent of the window elapsed, with a safe hourly rate.",
+        args: Args::Harness,
+        local: false,
+    },
+    Tool {
+        name: "usage_forecast",
+        description: "Forecast whether a subscription usage limit will run out before it resets, and when, at the current rate of use.",
+        args: Args::Harness,
+        local: false,
+    },
+    Tool {
+        name: "usage_reset_times",
+        description: "List when each subscription usage limit window resets, as a timestamp and as time remaining.",
+        args: Args::Harness,
+        local: false,
+    },
+    Tool {
+        name: "usage_remaining_quota",
+        description: "Show how much subscription quota is left in each usage window, and the tightest limit for each model group or pool.",
+        args: Args::Harness,
+        local: false,
+    },
+    Tool {
+        name: "rate_limit_status",
+        description: "Check whether a coding agent is rate limited right now because a usage limit is used up, and until when.",
+        args: Args::Harness,
+        local: false,
+    },
+    Tool {
+        name: "usage_extra_credits",
+        description: "Show extra usage, overage, or credit balance beyond the limits included in a subscription.",
+        args: Args::Harness,
+        local: false,
+    },
+    Tool {
+        name: "subscription_plan",
+        description: "Show which subscription plan and tier a coding agent's account is on.",
+        args: Args::Harness,
+        local: false,
+    },
+    Tool {
+        name: "usage_limits_all_harnesses",
+        description: "Compare subscription usage limits across Claude Code, Codex, Droid, and Antigravity to find which coding agent has headroom left.",
+        args: Args::None,
+        local: false,
+    },
+    Tool {
+        name: "usage_login_status",
+        description: "Explain why subscription usage data is missing or stale: sign-in, keyring, and last check for a coding agent.",
+        args: Args::Harness,
+        local: false,
+    },
+    Tool {
+        name: "token_usage_session",
+        description: "Show how many tokens this coding agent session has used so far: input, cache reads and writes, output, and reasoning, by model.",
+        args: Args::Harness,
+        local: true,
+    },
+    Tool {
+        name: "token_usage_recent",
+        description: "Show the tokens a coding agent used in the last 5 hours, 24 hours, 7 days, or 30 days, from its local logs.",
+        args: Args::HarnessPeriod,
+        local: true,
+    },
+    Tool {
+        name: "token_usage_by_model",
+        description: "Break down token usage by model over a recent period, with the share of input read from the prompt cache.",
+        args: Args::HarnessPeriod,
+        local: true,
+    },
+    Tool {
+        name: "token_usage_by_project",
+        description: "Break down token usage by project, meaning working directory, over a recent period to see which projects use the most.",
+        args: Args::HarnessPeriod,
+        local: true,
+    },
+    Tool {
+        name: "token_usage_limit_windows",
+        description: "Show how many tokens went into each current subscription usage limit window, next to the percent of the limit used.",
+        args: Args::Harness,
+        local: false,
+    },
+    Tool {
+        name: "token_usage_all_harnesses",
+        description: "Compare token usage across Claude Code, Codex, Droid, and Antigravity over a recent period.",
+        args: Args::Period,
+        local: true,
+    },
+    Tool {
+        name: "token_usage_sources",
+        description: "Explain why token usage data is missing: where a coding agent's logs are, how many files there are, and how recent.",
+        args: Args::Harness,
+        local: true,
+    },
 ];
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn exists(name: &str) -> bool {
-    TOOLS.iter().any(|(tool, _, _)| *tool == name)
+    TOOLS.iter().any(|tool| tool.name == name)
 }
 
 /// The `tools/list` result.
 pub fn list() -> Value {
     let names: Vec<&str> = Harness::ALL.iter().map(|h| h.name()).collect();
+    let periods: Vec<&str> = Period::ALL.iter().map(|p| p.name()).collect();
     let tools: Vec<Value> = TOOLS
         .iter()
-        .map(|(name, description, takes_harness)| {
-            let properties = if *takes_harness {
-                json!({ "harness": {
-                    "type": "string",
-                    "enum": names,
-                    "description": "Coding agent to check. Defaults to the one calling.",
-                }})
-            } else {
-                json!({})
-            };
+        .map(|tool| {
+            let mut properties = Map::new();
+            if tool.args.harness() {
+                properties.insert(
+                    "harness".to_owned(),
+                    json!({
+                        "type": "string",
+                        "enum": names,
+                        "description": "Coding agent to check. Defaults to the one calling.",
+                    }),
+                );
+            }
+            if tool.args.period() {
+                properties.insert(
+                    "period".to_owned(),
+                    json!({
+                        "type": "string",
+                        "enum": periods,
+                        "description": "How far back to look. Defaults to 24h.",
+                    }),
+                );
+            }
             json!({
-                "name": name,
-                "description": description,
+                "name": tool.name,
+                "description": tool.description,
                 "inputSchema": {
                     "type": "object",
                     "properties": properties,
                     "additionalProperties": false,
                 },
-                "annotations": { "readOnlyHint": true, "openWorldHint": true },
+                "annotations": { "readOnlyHint": true, "openWorldHint": !tool.local },
             })
         })
         .collect();
@@ -136,19 +228,33 @@ impl Tools {
     /// name, if known.
     pub fn call(&self, name: &str, arguments: &Value, client: Option<&str>) -> Value {
         let now = self.env.now();
-        if name == "usage_limits_all_harnesses" {
-            return match arguments {
-                Value::Null => self.all_harnesses(now),
-                Value::Object(map) if map.is_empty() => self.all_harnesses(now),
-                _ => failure("usage_limits_all_harnesses takes no arguments."),
-            };
+        let Some(tool) = TOOLS.iter().find(|tool| tool.name == name) else {
+            return failure(&format!("Unknown tool: {name}"));
+        };
+        let (named, period) = match parse_arguments(tool, arguments) {
+            Ok(parsed) => parsed,
+            Err(message) => return failure(&message),
+        };
+        let env = &*self.env;
+        match name {
+            "usage_limits_all_harnesses" => return self.all_harnesses(now),
+            "token_usage_all_harnesses" => return answer(report::all_harnesses(env, now, period)),
+            _ => {}
         }
-        let harness = match self.harness(arguments, client) {
+        let harness = match self.harness(named, client) {
             Ok(harness) => harness,
             Err(message) => return failure(&message),
         };
-        if name == "usage_login_status" {
-            return result(self.login_status(harness, now), false);
+        match name {
+            "usage_login_status" => return result(self.login_status(harness, now), false),
+            "token_usage_session" => return answer(report::session(harness, env, now)),
+            "token_usage_recent" => return answer(report::recent(harness, env, now, period)),
+            "token_usage_by_model" => return answer(report::by_model(harness, env, now, period)),
+            "token_usage_by_project" => {
+                return answer(report::by_project(harness, env, now, period));
+            }
+            "token_usage_sources" => return answer(report::sources(harness, env, now)),
+            _ => {}
         }
         let reading = self.reading(harness, now);
         let Some(snapshot) = &reading.snapshot else {
@@ -167,6 +273,10 @@ impl Tools {
                     "message": why.message(harness),
                 }),
             );
+        }
+        if name == "token_usage_limit_windows" {
+            out.extend(report::limit_windows(harness, env, now, snapshot));
+            return result(Value::Object(out), false);
         }
         let windows = |f: &dyn Fn(&Assessed) -> Value| -> Value {
             assessed.iter().map(f).collect::<Vec<_>>().into()
@@ -200,34 +310,14 @@ impl Tools {
 
     /// The harness named in the arguments, else `TO11Y_HARNESS`, else the
     /// calling harness.
-    fn harness(&self, arguments: &Value, client: Option<&str>) -> Result<Harness, String> {
-        let valid = || {
-            let names: Vec<&str> = Harness::ALL.iter().map(|h| h.name()).collect();
-            names.join(", ")
-        };
-        let named = match arguments {
-            Value::Null => None,
-            Value::Object(map) => {
-                if let Some(key) = map.keys().find(|key| *key != "harness") {
-                    return Err(format!("Unknown argument {key}. The only one is harness."));
-                }
-                match map.get("harness") {
-                    None | Some(Value::Null) => None,
-                    Some(Value::String(name)) => Some(Harness::parse(name).ok_or_else(|| {
-                        format!("Unknown harness {name}. Use one of: {}.", valid())
-                    })?),
-                    Some(_) => return Err(format!("harness must be one of: {}.", valid())),
-                }
-            }
-            _ => return Err("Arguments must be an object.".to_owned()),
-        };
+    fn harness(&self, named: Option<Harness>, client: Option<&str>) -> Result<Harness, String> {
         named
             .or_else(|| self.env.harness.as_deref().and_then(Harness::parse))
             .or_else(|| detect(client?))
             .ok_or_else(|| {
                 format!(
                     "Couldn't tell which coding agent is calling. Pass harness, one of: {}.",
-                    valid()
+                    harness_names()
                 )
             })
     }
@@ -361,6 +451,62 @@ fn detect(client: &str) -> Option<Harness> {
     .map(|(_, harness)| harness)
 }
 
+fn harness_names() -> String {
+    let names: Vec<&str> = Harness::ALL.iter().map(|h| h.name()).collect();
+    names.join(", ")
+}
+
+/// The harness and period in a tool's arguments. Missing ones are `None`
+/// and the default period.
+fn parse_arguments(tool: &Tool, arguments: &Value) -> Result<(Option<Harness>, Period), String> {
+    let map = match arguments {
+        Value::Null => return Ok((None, Period::Day)),
+        Value::Object(map) => map,
+        _ => return Err("Arguments must be an object.".to_owned()),
+    };
+    let mut allowed = Vec::new();
+    if tool.args.harness() {
+        allowed.push("harness");
+    }
+    if tool.args.period() {
+        allowed.push("period");
+    }
+    if let Some(key) = map.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(if allowed.is_empty() {
+            format!("{} takes no arguments.", tool.name)
+        } else {
+            format!(
+                "Unknown argument {key}. {} takes: {}.",
+                tool.name,
+                allowed.join(", ")
+            )
+        });
+    }
+    let harness =
+        match map.get("harness") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(name)) => Some(Harness::parse(name).ok_or_else(|| {
+                format!("Unknown harness {name}. Use one of: {}.", harness_names())
+            })?),
+            Some(_) => return Err(format!("harness must be one of: {}.", harness_names())),
+        };
+    let periods = || {
+        let names: Vec<&str> = Period::ALL.iter().map(|p| p.name()).collect();
+        names.join(", ")
+    };
+    let period = match map.get("period") {
+        None | Some(Value::Null) => Period::Day,
+        Some(Value::String(name)) => Period::parse(name)
+            .ok_or_else(|| format!("Unknown period {name}. Use one of: {}.", periods()))?,
+        Some(_) => return Err(format!("period must be one of: {}.", periods())),
+    };
+    Ok((harness, period))
+}
+
+fn answer((value, is_error): report::Answer) -> Value {
+    result(value, is_error)
+}
+
 fn result(value: Value, is_error: bool) -> Value {
     json!({
         "content": [{ "type": "text", "text": value.to_string() }],
@@ -390,7 +536,7 @@ fn put(map: &mut Map<String, Value>, key: &str, value: Value) {
 }
 
 /// A percentage to one decimal place, without a trailing `.0`.
-fn percent(value: f64) -> Value {
+pub(crate) fn percent(value: f64) -> Value {
     let rounded = (value * 10.0).round() / 10.0;
     if rounded.fract() == 0.0 && rounded.abs() < 1e15 {
         json!(rounded as i64)
@@ -625,13 +771,13 @@ mod tests {
     fn the_tool_list_is_small_and_every_tool_is_read_only() {
         let list = list();
         let tools = list["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 17);
         for tool in tools {
             assert_eq!(tool["annotations"]["readOnlyHint"], true);
             assert!(tool["description"].as_str().unwrap().len() < 160);
         }
-        // About four bytes to a token: 1,500 tokens is about 6,000 bytes.
-        assert!(list.to_string().len() < 6_000, "{}", list.to_string().len());
+        // About four bytes to a token: 2,200 tokens is about 8,800 bytes.
+        assert!(list.to_string().len() < 8_800, "{}", list.to_string().len());
     }
 
     #[test]
@@ -760,11 +906,295 @@ mod tests {
         assert_eq!(percent(2.94), json!(2.9));
     }
 
+    /// A copy of the fixture home with logs for all four harnesses, and
+    /// tools that read it as Claude Code's session `planted-session-claude`
+    /// started in `/work/app`.
+    fn log_tools() -> (crate::testing::TempDir, Tools) {
+        let dir = crate::testing::TempDir::new(&format!("tools-logs-{}", next_id()));
+        let home = dir.copy(
+            std::path::Path::new(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/logs/home"
+            )),
+            "home",
+        );
+        let tools = Tools::new(Env {
+            home: Some(home),
+            now: Some(NOW),
+            started: Some(NOW - 4800),
+            fixtures: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures").into()),
+            claude_session_id: Some("planted-session-claude".to_owned()),
+            cwd: Some("/work/app".into()),
+            ..Env::default()
+        });
+        (dir, tools)
+    }
+
+    #[test]
+    fn after_clear_the_session_is_the_one_claude_code_is_in_now() {
+        let (dir, _) = log_tools();
+        // to11y (pid 40) was started by Claude Code (pid 20), which has
+        // moved on from the session it passed at start.
+        dir.write(
+            "proc/40/stat",
+            "40 (to11y) S 20 40 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 900 0",
+        );
+        dir.write(
+            "proc/20/stat",
+            "20 (claude) S 1 20 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 700 0",
+        );
+        dir.write(
+            "home/.claude/sessions/20.json",
+            r#"{"pid":20,"sessionId":"other-session","procStart":"700"}"#,
+        );
+        let tools = Tools::new(Env {
+            home: Some(dir.path().join("home")),
+            now: Some(NOW),
+            claude_session_id: Some("planted-session-claude".to_owned()),
+            pid: Some(40),
+            proc_dir: Some(dir.path().join("proc")),
+            ..Env::default()
+        });
+        let (out, error) = call(
+            &tools,
+            "token_usage_session",
+            json!({"harness": "claude-code"}),
+        );
+        assert!(!error, "{out}");
+        assert_eq!(out["matched_by"], "the session Claude Code is in now");
+        assert_ne!(out["tokens"]["requests"], 4);
+        assert!(!out.to_string().contains("other-session"));
+    }
+
+    fn next_id() -> usize {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    }
+
+    #[test]
+    fn recent_tokens_add_up_each_channel() {
+        let (_dir, tools) = log_tools();
+        let (out, error) = call(
+            &tools,
+            "token_usage_recent",
+            json!({"harness": "claude-code"}),
+        );
+        assert!(!error, "{out}");
+        assert_eq!(out["period"], "24h");
+        assert_eq!(
+            out["tokens"],
+            json!({"total": 256_974, "input": 70_020, "cache_read": 176_932, "cache_write": 3199,
+                   "output": 6823, "reasoning": 100, "requests": 5, "cache_read_percent": 70.7})
+        );
+        let (out, _) = call(&tools, "token_usage_recent", json!({"harness": "codex"}));
+        assert_eq!(
+            out["tokens"],
+            json!({"total": 47_750, "input": 11_000, "cache_read": 35_000, "cache_write": 1000,
+                   "output": 750, "reasoning": 260, "requests": 3, "cache_read_percent": 74.5})
+        );
+        let (out, _) = call(&tools, "token_usage_recent", json!({"harness": "droid"}));
+        assert_eq!(out["tokens"]["total"], 21_600);
+        assert_eq!(out["tokens"]["requests"], 2);
+        let (out, _) = call(
+            &tools,
+            "token_usage_recent",
+            json!({"harness": "antigravity"}),
+        );
+        assert_eq!(out["tokens"]["total"], 36_096);
+        assert!(out["tokens"].get("cache_write").is_none());
+    }
+
+    #[test]
+    fn a_longer_period_reaches_older_events() {
+        let (_dir, tools) = log_tools();
+        let (day, _) = call(
+            &tools,
+            "token_usage_recent",
+            json!({"harness": "claude-code"}),
+        );
+        let (week, _) = call(
+            &tools,
+            "token_usage_recent",
+            json!({"harness": "claude-code", "period": "7d"}),
+        );
+        assert_eq!(
+            week["tokens"]["requests"],
+            day["tokens"]["requests"].as_u64().unwrap() + 1
+        );
+        let (hours, _) = call(
+            &tools,
+            "token_usage_recent",
+            json!({"harness": "claude-code", "period": "5h"}),
+        );
+        assert_eq!(hours["tokens"]["requests"], 5);
+    }
+
+    #[test]
+    fn models_and_projects_are_ranked_by_total() {
+        let (_dir, tools) = log_tools();
+        let (out, _) = call(
+            &tools,
+            "token_usage_by_model",
+            json!({"harness": "claude-code"}),
+        );
+        let models: Vec<&str> = out["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["model"].as_str().unwrap())
+            .collect();
+        assert_eq!(models, ["claude-opus-5-5", "claude-fable-5-2"]);
+        assert_eq!(out["models"][1]["total"], 78_205);
+        let (out, _) = call(
+            &tools,
+            "token_usage_by_project",
+            json!({"harness": "claude-code"}),
+        );
+        let projects: Vec<&str> = out["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["project"].as_str().unwrap())
+            .collect();
+        assert_eq!(projects, ["/work/app", "temporary directories"]);
+        let (out, _) = call(
+            &tools,
+            "token_usage_by_project",
+            json!({"harness": "droid"}),
+        );
+        assert_eq!(out["projects"][0]["project"], "/work/site");
+    }
+
+    #[test]
+    fn the_session_is_the_callers_own() {
+        let (_dir, tools) = log_tools();
+        let (out, error) = call(
+            &tools,
+            "token_usage_session",
+            json!({"harness": "claude-code"}),
+        );
+        assert!(!error, "{out}");
+        assert_eq!(
+            out["matched_by"],
+            "the session id Claude Code passed at start"
+        );
+        assert_eq!(out["tokens"]["requests"], 4);
+        assert_eq!(out["started"], "1h 31m ago");
+        let (out, error) = call(&tools, "token_usage_session", json!({"harness": "codex"}));
+        assert!(!error, "{out}");
+        assert_eq!(out["tokens"]["requests"], 3);
+        assert_eq!(out["models"][0]["model"], "gpt-6.1-sol");
+        let (out, _) = call(&tools, "token_usage_session", json!({"harness": "droid"}));
+        assert_eq!(out["matched_by"], "the latest Droid session");
+        assert_eq!(out["tokens"]["total"], 21_600);
+        assert_eq!(out["model"], "gpt-6.1-sol");
+        let (out, _) = call(
+            &tools,
+            "token_usage_session",
+            json!({"harness": "antigravity"}),
+        );
+        assert_eq!(out["tokens"]["requests"], 2);
+    }
+
+    #[test]
+    fn a_codex_session_from_another_directory_is_not_the_caller() {
+        let (dir, _) = log_tools();
+        let tools = Tools::new(Env {
+            home: Some(dir.path().join("home")),
+            now: Some(NOW),
+            started: Some(NOW - 4800),
+            cwd: Some("/elsewhere".into()),
+            ..Env::default()
+        });
+        let (out, error) = call(&tools, "token_usage_session", json!({"harness": "codex"}));
+        assert!(error);
+        assert_eq!(out["unavailable"], "no_session");
+    }
+
+    #[test]
+    fn limit_windows_count_the_models_they_limit() {
+        let (_dir, tools) = log_tools();
+        let (out, error) = call(
+            &tools,
+            "token_usage_limit_windows",
+            json!({"harness": "claude-code"}),
+        );
+        assert!(!error, "{out}");
+        let windows = out["windows"].as_array().unwrap();
+        let weekly = windows.iter().find(|w| w["window"] == "weekly").unwrap();
+        assert_eq!(weekly["tokens"]["total"], 256_974);
+        let fable = windows
+            .iter()
+            .find(|w| w["window"] == "weekly:fable")
+            .unwrap();
+        assert_eq!(fable["tokens"]["total"], 78_205);
+        assert!(out["note"].as_str().unwrap().contains("this machine"));
+        let (limits, _) = call(&tools, "usage_limits", json!({"harness": "claude-code"}));
+        let limit = limits["windows"].as_array().unwrap();
+        let limit = limit.iter().find(|w| w["window"] == "weekly").unwrap();
+        assert_eq!(weekly["used_percent"], limit["used_percent"]);
+    }
+
+    #[test]
+    fn all_harnesses_compare_their_totals() {
+        let (_dir, tools) = log_tools();
+        let (out, _) = call(
+            &tools,
+            "token_usage_all_harnesses",
+            json!({"period": "24h"}),
+        );
+        let totals: Vec<u64> = out["harnesses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["tokens"]["total"].as_u64().unwrap())
+            .collect();
+        assert_eq!(totals, [256_974, 47_750, 21_600, 36_096]);
+    }
+
+    #[test]
+    fn sources_say_where_the_logs_are() {
+        let (_dir, with_logs) = log_tools();
+        let (out, error) = call(
+            &with_logs,
+            "token_usage_sources",
+            json!({"harness": "claude-code"}),
+        );
+        assert!(!error);
+        assert_eq!(out["folder"], "~/.claude/projects");
+        assert_eq!(out["files"], 3);
+        let (out, error) = call(&tools(), "token_usage_sources", json!({"harness": "codex"}));
+        assert!(error);
+        assert_eq!(out["unavailable"], "no_logs");
+    }
+
+    #[test]
+    fn bad_arguments_name_what_the_tool_takes() {
+        let (out, error) = call(&tools(), "token_usage_recent", json!({"period": "1y"}));
+        assert!(error);
+        assert!(out["error"].as_str().unwrap().contains("5h, 24h, 7d, 30d"));
+        let (out, _) = call(&tools(), "usage_limits", json!({"period": "7d"}));
+        assert_eq!(
+            out["error"],
+            "Unknown argument period. usage_limits takes: harness."
+        );
+        let (out, _) = call(
+            &tools(),
+            "usage_limits_all_harnesses",
+            json!({"harness": "codex"}),
+        );
+        assert_eq!(
+            out["error"],
+            "usage_limits_all_harnesses takes no arguments."
+        );
+    }
+
     #[test]
     fn no_fixture_identifier_reaches_any_tool() {
-        let tools = tools();
-        for (name, _, takes_harness) in TOOLS {
-            let harnesses: Vec<Value> = if takes_harness {
+        let (_dir, tools) = log_tools();
+        for tool in &TOOLS {
+            let harnesses: Vec<Value> = if tool.args.harness() {
                 Harness::ALL
                     .iter()
                     .map(|h| json!({"harness": h.name()}))
@@ -773,9 +1203,19 @@ mod tests {
                 vec![Value::Null]
             };
             for arguments in harnesses {
-                let text = tools.call(name, &arguments, None).to_string();
-                for secret in ["user-fixture", "00000000-0000-4000-8000", "example.invalid"] {
-                    assert!(!text.contains(secret), "{name} leaked {secret}");
+                let text = tools.call(tool.name, &arguments, None).to_string();
+                for secret in [
+                    "user-fixture",
+                    "00000000-0000-4000-8000",
+                    "example.invalid",
+                    "planted",
+                    "0f3a9c1e2b7d44aa",
+                ] {
+                    assert!(
+                        !text.contains(secret),
+                        "{} leaked {secret}: {text}",
+                        tool.name
+                    );
                 }
             }
         }

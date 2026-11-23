@@ -23,11 +23,32 @@ pub struct Env {
     pub now: Option<i64>,
     /// `TO11Y_FIXTURES`, read only in debug builds.
     pub fixtures: Option<PathBuf>,
+    /// `CLAUDE_CODE_SESSION_ID`, which Claude Code gives its MCP servers.
+    /// Other harnesses started from inside Claude Code inherit it, so it
+    /// only means something when Claude Code is the one calling.
+    pub claude_session_id: Option<String>,
+    /// The working directory to11y was started in. Codex and agy start
+    /// their MCP servers in the session's directory.
+    pub cwd: Option<PathBuf>,
+    /// `TMPDIR`, grouped with `/tmp` when naming projects.
+    pub tmpdir: Option<PathBuf>,
+    /// When to11y started, in Unix seconds.
+    pub started: Option<i64>,
+    /// to11y's process id, and where the processes are listed (`/proc`).
+    /// The session tool walks up from it to the Claude Code that started
+    /// to11y.
+    pub pid: Option<u32>,
+    pub proc_dir: Option<PathBuf>,
 }
 
 impl Env {
     pub fn from_process() -> Self {
-        Self::from_vars(|name| std::env::var_os(name))
+        let mut env = Self::from_vars(|name| std::env::var_os(name));
+        env.cwd = std::env::current_dir().ok();
+        env.started = Some(env.now());
+        env.pid = Some(std::process::id());
+        env.proc_dir = Some(PathBuf::from("/proc"));
+        env
     }
 
     /// Unset and empty variables are the same. Relative paths are ignored,
@@ -54,6 +75,12 @@ impl Env {
             harness: text("TO11Y_HARNESS"),
             now: None,
             fixtures: None,
+            claude_session_id: text("CLAUDE_CODE_SESSION_ID"),
+            cwd: None,
+            tmpdir: dir("TMPDIR"),
+            started: None,
+            pid: None,
+            proc_dir: None,
         };
         if cfg!(debug_assertions) {
             env.now = text("TO11Y_NOW").and_then(|value| time::parse(&value));
@@ -86,6 +113,16 @@ impl Env {
 
     pub fn antigravity_dir(&self) -> Option<PathBuf> {
         self.in_home(".gemini/antigravity")
+    }
+
+    /// Where the Antigravity CLI keeps its conversations.
+    pub fn antigravity_cli_dir(&self) -> Option<PathBuf> {
+        self.in_home(".gemini/antigravity-cli")
+    }
+
+    /// When to11y started: the test clock if set, else the real start.
+    pub fn started(&self) -> i64 {
+        self.started.unwrap_or_else(|| self.now())
     }
 
     pub fn cache_dir(&self) -> Option<PathBuf> {

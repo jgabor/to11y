@@ -34,6 +34,12 @@ check:
     just lint
     just test
 
+# Check token totals on this machine's logs against ccusage and Factory's
+# own totals. Prints totals only. Takes a ccusage binary, then optionally
+# the number of days (1, 7, or 30) and the UTC end date.
+oracle-tokens ccusage *args: build
+    python3 -I scripts/oracle_tokens.py {{ccusage}} {{args}}
+
 # Package the crate and build it as crates.io would, without publishing.
 publish-check:
     cargo publish --dry-run --locked

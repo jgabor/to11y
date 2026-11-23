@@ -1,10 +1,10 @@
 [package]
 name = "to11y"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
-description = "Subscription usage limits, pacing, and reset times for coding agents, over MCP"
+description = "Subscription usage limits, pacing, reset times, and token usage for coding agents, over MCP"
 repository = "https://github.com/jgabor/to11y"
 readme = "README.md"
 keywords = ["mcp", "claude-code", "codex", "rate-limit", "usage"]
@@ -15,6 +15,8 @@ include = ["/src", "/README.md", "/LICENSE"]
 # Decrypts Droid's stored login. Factory uses a 16-byte nonce, which
 # graviola's AES-GCM doesn't take.
 aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
+# Finds the lines worth parsing in large logs. serde_json already brings it.
+memchr = "2"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 rustls-graviola = "0.4"
 serde_json = "1"

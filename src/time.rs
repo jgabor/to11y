@@ -16,6 +16,12 @@ pub fn now() -> i64 {
 /// Parses `YYYY-MM-DDTHH:MM:SS[.fraction](Z|±HH:MM)` into Unix seconds.
 /// The fraction is dropped, rounding toward the past.
 pub fn parse(text: &str) -> Option<i64> {
+    parse_millis(text).map(|millis| millis.div_euclid(1000))
+}
+
+/// Like `parse`, in milliseconds. Digits past the third are dropped,
+/// rounding toward the past.
+pub fn parse_millis(text: &str) -> Option<i64> {
     let b = text.as_bytes();
     if b.len() < 20 {
         return None;
@@ -47,14 +53,21 @@ pub fn parse(text: &str) -> Option<i64> {
         return None;
     }
     let mut at = 19;
+    let mut millis = 0;
     if b[at] == b'.' {
         at += 1;
         let start = at;
         while b.get(at).is_some_and(u8::is_ascii_digit) {
+            if at - start < 3 {
+                millis = millis * 10 + i64::from(b[at] - b'0');
+            }
             at += 1;
         }
         if at == start {
             return None;
+        }
+        for _ in at - start..3 {
+            millis *= 10;
         }
     }
     let offset = match b.get(at)? {
@@ -70,7 +83,7 @@ pub fn parse(text: &str) -> Option<i64> {
         _ => return None,
     };
     let days = days_from_civil(year, month, day);
-    Some(days * 86_400 + hour * 3600 + minute * 60 + second - offset)
+    Some((days * 86_400 + hour * 3600 + minute * 60 + second - offset) * 1000 + millis)
 }
 
 /// Formats Unix seconds as `YYYY-MM-DDTHH:MM:SSZ`.
@@ -243,6 +256,26 @@ mod tests {
                 offset_minutes.abs() % 60
             );
             assert_eq!(parse(&text), oracle(&text), "{text}");
+        }
+    }
+
+    /// Milliseconds agree with jiff, floored as ours are.
+    #[test]
+    fn milliseconds_match_jiff() {
+        let millis = |text: &str| {
+            let t = text.parse::<jiff::Timestamp>().unwrap();
+            t.as_nanosecond().div_euclid(1_000_000) as i64
+        };
+        for text in [
+            "2026-10-12T05:36:41.397Z",
+            "2026-10-12T05:36:41.3Z",
+            "2026-10-12T05:36:41.39999Z",
+            "2026-10-12T05:36:41Z",
+            "1969-12-31T23:59:59.999Z",
+            "1960-06-01T12:00:00.001-03:00",
+            "2026-11-23T16:31:07.631392526+01:00",
+        ] {
+            assert_eq!(parse_millis(text), Some(millis(text)), "{text}");
         }
     }
 

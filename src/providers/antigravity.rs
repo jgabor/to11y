@@ -2,8 +2,9 @@
 //! in the system keyring. When that sign-in has expired, Antigravity's own
 //! `agy -p /usage` gives the same groups, and renews it.
 
+use std::ffi::{OsStr, OsString};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -45,7 +46,7 @@ pub fn fetch(cx: &Context, now: i64) -> Result<Snapshot, Failure> {
     crate::cache::make_dir(&dir).map_err(|_| {
         Unavailable::Failed("to11y couldn't create its cache directory.".to_owned())
     })?;
-    let out = run_agy(&program, &dir, AGY_TIMEOUT)?;
+    let out = run_agy(&program, &dir, cx.env.path.as_deref(), AGY_TIMEOUT)?;
     let json: Value = serde_json::from_slice(&out)
         .map_err(|_| Unavailable::Failed("agy's /usage answer isn't JSON.".to_owned()))?;
     Ok(parse(&json, now)?)
@@ -73,12 +74,32 @@ fn direct(cx: &Context, login: &Login, now: i64) -> Result<Snapshot, Failure> {
 /// `agy -p /usage --output-format json`, with nothing on its stdin, its
 /// errors dropped, and `dir` as its working directory. Killed after
 /// `timeout`.
-fn run_agy(program: &Path, dir: &Path, timeout: Duration) -> Result<Vec<u8>, Unavailable> {
+///
+/// It can't update itself or open a browser: a sign-in that can't renew
+/// silently would otherwise open one. `path` is the `PATH` to give it,
+/// after the folder that holds the browser stub.
+fn run_agy(
+    program: &Path,
+    dir: &Path,
+    path: Option<&OsStr>,
+    timeout: Duration,
+) -> Result<Vec<u8>, Unavailable> {
+    let no_browser = no_browser(dir).map_err(|_| {
+        Unavailable::Failed("to11y couldn't keep agy from opening a browser.".to_owned())
+    })?;
+    let mut search = OsString::from(dir.join(NO_BROWSER));
+    if let Some(path) = path.filter(|path| !path.is_empty()) {
+        search.push(":");
+        search.push(path);
+    }
     let spawn = || {
         Command::new(program)
             .args(["-p", "/usage", "--output-format", "json"])
             .current_dir(dir)
             .env("TO11Y_NO_AGY", "1")
+            .env("AGY_CLI_DISABLE_AUTO_UPDATE", "true")
+            .env("PATH", &search)
+            .env("BROWSER", &no_browser)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -135,6 +156,35 @@ fn run_agy(program: &Path, dir: &Path, timeout: Duration) -> Result<Vec<u8>, Una
         .saturating_sub(started.elapsed())
         .max(Duration::from_secs(1));
     receive.recv_timeout(left).map_err(|_| too_slow())
+}
+
+/// The folder, inside the cache, whose `xdg-open` always fails.
+const NO_BROWSER: &str = "no-browser";
+
+/// Writes the `xdg-open` that always fails, unless it is already there,
+/// and returns its path.
+fn no_browser(dir: &Path) -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    const STUB: &[u8] = b"#!/bin/sh\nexit 1\n";
+    let folder = dir.join(NO_BROWSER);
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&folder)?;
+    let stub = folder.join("xdg-open");
+    if std::fs::read(&stub).ok().as_deref() != Some(STUB) {
+        let partial = folder.join("xdg-open.partial");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o700)
+            .open(&partial)?;
+        std::io::Write::write_all(&mut file, STUB)?;
+        drop(file);
+        std::fs::rename(&partial, &stub)?;
+    }
+    Ok(stub)
 }
 
 /// Windows from either answer: `retrieveUserQuotaSummary`, or the JSON of
@@ -266,12 +316,16 @@ mod tests {
     #[test]
     fn an_expired_sign_in_asks_agy_instead() {
         let dir = TempDir::new("agy-fallback");
-        // The stub answers only when to11y runs it the way it should.
+        // The stub answers only when to11y runs it the way it should: no
+        // updates, and no browser either way agy might open one.
+        let cache = dir.path().canonicalize().unwrap().join("cache/to11y");
+        let stub = cache.join("no-browser/xdg-open");
         dir.script(
             "bin/agy",
             &format!(
-                r#"[ "$TO11Y_NO_AGY" = 1 ] && [ "$(pwd -P)" = "{}" ] && [ "$*" = "-p /usage --output-format json" ] && exec cat "{AGY_FIXTURE}"; exit 3"#,
-                dir.path().canonicalize().unwrap().join("cache/to11y").display()
+                r#"[ "$TO11Y_NO_AGY" = 1 ] && [ "$(pwd -P)" = "{cache}" ] && [ "$*" = "-p /usage --output-format json" ] && [ "$AGY_CLI_DISABLE_AUTO_UPDATE" = true ] && [ "$(command -v xdg-open)" = "{stub}" ] && [ "$BROWSER" = "{stub}" ] && ! xdg-open https://example.invalid && PATH=/usr/bin:/bin exec cat "{AGY_FIXTURE}"; exit 3"#,
+                cache = cache.display(),
+                stub = stub.display(),
             ),
         );
         let snapshot = fetch(&context(&dir, expired()), NOW).unwrap();
@@ -294,7 +348,9 @@ mod tests {
         let dir = TempDir::new("agy-hang");
         let program = dir.script("bin/agy", "exec sleep 5");
         let started = Instant::now();
-        let error = run_agy(&program, dir.path(), Duration::from_millis(300)).unwrap_err();
+        let path = std::env::var_os("PATH");
+        let timeout = Duration::from_millis(300);
+        let error = run_agy(&program, dir.path(), path.as_deref(), timeout).unwrap_err();
         assert!(matches!(error, Unavailable::Failed(_)));
         assert!(started.elapsed() < Duration::from_secs(2));
     }
@@ -303,7 +359,8 @@ mod tests {
     fn an_agy_that_fails_is_a_failure() {
         let dir = TempDir::new("agy-fails");
         let program = dir.script("bin/agy", "echo '{}'; exit 4");
-        let error = run_agy(&program, dir.path(), AGY_TIMEOUT).unwrap_err();
+        let path = std::env::var_os("PATH");
+        let error = run_agy(&program, dir.path(), path.as_deref(), AGY_TIMEOUT).unwrap_err();
         assert_eq!(
             error,
             Unavailable::Failed("agy failed with exit status: 4.".to_owned())

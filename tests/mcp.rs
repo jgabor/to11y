@@ -59,7 +59,7 @@ async fn rmcp_completes_the_legacy_handshake() {
     let info = client.peer_info().unwrap();
     assert_eq!(info.protocol_version, ProtocolVersion::V_2025_11_25);
     assert_eq!(info.server_info.as_ref().unwrap().name, "to11y");
-    assert_eq!(client.list_all_tools().await.unwrap().len(), 10);
+    assert_eq!(client.list_all_tools().await.unwrap().len(), 17);
     // No harness argument: the client's name says it is Claude Code.
     let result = client
         .call_tool(call("usage_limits", Value::Null))
@@ -82,7 +82,7 @@ async fn rmcp_discovers_the_2026_lifecycle() {
         client.peer_info().unwrap().protocol_version,
         ProtocolVersion::V_2026_07_28
     );
-    assert_eq!(client.list_all_tools().await.unwrap().len(), 10);
+    assert_eq!(client.list_all_tools().await.unwrap().len(), 17);
     let result = client
         .call_tool(call("subscription_plan", Value::Null))
         .await
@@ -123,6 +123,30 @@ async fn rmcp_in_auto_mode_picks_the_2026_lifecycle() {
         .await
         .unwrap();
     assert_eq!(text(&result)["harness"], "droid");
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn token_tools_read_the_logs_of_the_calling_session() {
+    let sandbox = Sandbox::new("tokens").with_logs("planted-session-claude");
+    let client = connect(&sandbox, "claude-code", ClientLifecycleMode::Initialize).await;
+    let result = client
+        .call_tool(call("token_usage_session", Value::Null))
+        .await
+        .unwrap();
+    let out = text(&result);
+    assert_eq!(out["harness"], "claude-code");
+    assert_eq!(out["tokens"]["requests"], 4);
+    let result = client
+        .call_tool(call("token_usage_recent", json!({"period": "1y"})))
+        .await
+        .unwrap();
+    assert_eq!(result.is_error, Some(true));
+    let result = client
+        .call_tool(call("token_usage_all_harnesses", json!({"period": "7d"})))
+        .await
+        .unwrap();
+    assert_eq!(text(&result)["harnesses"].as_array().unwrap().len(), 4);
     client.cancel().await.unwrap();
 }
 

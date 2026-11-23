@@ -26,6 +26,25 @@ impl TempDir {
         path
     }
 
+    /// Copies the folder `from` into this directory, under `relative`.
+    pub fn copy(&self, from: &Path, relative: &str) -> PathBuf {
+        fn copy(from: &Path, to: &Path) {
+            std::fs::create_dir_all(to).unwrap();
+            for entry in std::fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                let target = to.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy(&entry.path(), &target);
+                } else {
+                    std::fs::copy(entry.path(), &target).unwrap();
+                }
+            }
+        }
+        let to = self.0.join(relative);
+        copy(from, &to);
+        to
+    }
+
     /// Writes an executable shell script to `relative`.
     pub fn script(&self, relative: &str, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;

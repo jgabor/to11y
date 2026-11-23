@@ -1,5 +1,5 @@
-//! to11y: subscription usage limits, pacing, and reset times for coding
-//! agents, served over MCP on stdio.
+//! to11y: subscription usage limits, pacing, reset times, and token usage
+//! for coding agents, served over MCP on stdio.
 
 mod base64;
 mod cache;
@@ -14,13 +14,15 @@ mod providers;
 #[cfg(test)]
 mod testing;
 mod time;
+mod tokens;
 mod tools;
 
 use std::io::Write;
 use std::process::ExitCode;
 
 const HELP: &str = "\
-to11y: subscription usage limits, pacing, and reset times for coding agents.
+to11y: subscription usage limits, pacing, reset times, and token usage for
+coding agents.
 
 It is an MCP server over stdio. Add it to a coding agent as a stdio server
 whose command is `to11y`, with no arguments.

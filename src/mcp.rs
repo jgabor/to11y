@@ -35,9 +35,9 @@ const INVALID_PARAMS: i64 = -32602;
 const INTERNAL_ERROR: i64 = -32603;
 const UNSUPPORTED_VERSION: i64 = -32022;
 
-const INSTRUCTIONS: &str = "Subscription usage limits, pacing, and reset times for \
-Claude Code, Codex, Droid, and Antigravity. Each tool takes an optional harness; \
-the default is the agent calling the tool.";
+const INSTRUCTIONS: &str = "Subscription usage limits, pacing, reset times, and token \
+usage from local logs for Claude Code, Codex, Droid, and Antigravity. Each tool takes \
+an optional harness; the default is the agent calling the tool.";
 
 pub struct Server<W> {
     out: Mutex<W>,
@@ -405,7 +405,7 @@ mod tests {
             assert_eq!(result["ttlMs"], TTL_MS);
             assert_eq!(result["cacheScope"], "public");
         }
-        assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 10);
+        assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 17);
     }
 
     #[test]
@@ -444,7 +444,7 @@ mod tests {
         ]);
         assert_eq!(replies.len(), 2);
         assert_eq!(replies[1]["id"], "two");
-        assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 10);
+        assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 17);
         assert_eq!(replies[1]["result"].get("resultType"), None);
     }
 
