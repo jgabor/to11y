@@ -1,14 +1,28 @@
 //! Codex: ChatGPT's usage endpoint, with the sign-in Codex stores in
 //! `auth.json`.
 
-use serde_json::Value;
+use std::cmp::Reverse;
+use std::fs::File;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::path::Path;
+
+use serde_json::{Value, json};
 
 use crate::creds;
-use crate::model::{Credits, Harness, Money, Snapshot, Unavailable, Window};
+use crate::env::Env;
+use crate::model::{Credits, Harness, Money, Origin, Snapshot, Unavailable, Window};
 use crate::pace::ALL;
 use crate::providers::{Context, Failure, length_id, length_label, request, slug, window};
+use crate::{time, tokens};
 
 const URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+
+/// How many of the newest rollouts are searched for a saved reading.
+const SAVED_FILES: usize = 5;
+
+/// How much of the end of each rollout is read. A reading comes with every
+/// response, so the newest one is near the end.
+const TAIL_BYTES: u64 = 256 * 1024;
 
 pub fn fetch(cx: &Context, now: i64) -> Result<Snapshot, Failure> {
     let login = creds::codex(&cx.env)?;
@@ -25,6 +39,83 @@ pub fn fetch(cx: &Context, now: i64) -> Result<Snapshot, Failure> {
     }
     let body = request(cx, Harness::Codex, URL, &headers, None)?;
     Ok(parse(&body, now)?)
+}
+
+/// The newest reading Codex saved in its rollouts, in the usage response's
+/// shape. It lacks the additional limits, so it never replaces a call.
+pub fn saved(env: &Env, now: i64) -> Option<Snapshot> {
+    creds::codex(env).ok()?;
+    let mut files = Vec::new();
+    let root = env.codex_dir()?.join("sessions");
+    tokens::walk(&root, 4, &|path| tokens::named(path, ".jsonl"), &mut files);
+    files.sort_by_key(|file| Reverse(file.mtime));
+    let (at, limits) = files
+        .iter()
+        .take(SAVED_FILES)
+        .filter_map(|file| latest_limits(&file.path, now))
+        .max_by_key(|(at, _)| *at)?;
+    let mut snapshot = parse(&as_usage(&limits), at).ok()?;
+    snapshot.origin = Origin::Saved;
+    Some(snapshot)
+}
+
+/// The `rate_limits` of the newest `token_count` line, not after `now`, in
+/// the end of a rollout.
+fn latest_limits(path: &Path, now: i64) -> Option<(i64, Value)> {
+    let mut file = File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(TAIL_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut read = BufReader::new(file.take(TAIL_BYTES));
+    if start > 0 {
+        // The first line is cut, so it is skipped.
+        read.read_until(b'\n', &mut Vec::new()).ok()?;
+    }
+    let mut best: Option<(i64, Value)> = None;
+    tokens::lines(&mut read, |line| {
+        if !tokens::has(line, b"\"rate_limits\"") || !tokens::has(line, b"token_count") {
+            return;
+        }
+        let Ok(mut value) = serde_json::from_slice::<Value>(line) else {
+            return;
+        };
+        let payload = &value["payload"];
+        let limits = &payload["rate_limits"];
+        let codex = limits["limit_id"].is_null() || limits["limit_id"] == "codex";
+        if payload["type"] != "token_count" || !codex || !limits["primary"].is_object() {
+            return;
+        }
+        let Some(at) = value["timestamp"].as_str().and_then(time::parse) else {
+            return;
+        };
+        if at <= now && best.as_ref().is_none_or(|(best, _)| at >= *best) {
+            best = Some((at, value["payload"]["rate_limits"].take()));
+        }
+    });
+    best
+}
+
+/// A rollout's `rate_limits` rewritten in the usage response's shape, so
+/// its windows get the same ids.
+fn as_usage(limits: &Value) -> Value {
+    let window = |w: &Value| {
+        if !w.is_object() {
+            return Value::Null;
+        }
+        json!({
+            "used_percent": w["used_percent"],
+            "limit_window_seconds": w["window_minutes"].as_u64().map(|m| m * 60),
+            "reset_at": w["resets_at"],
+        })
+    };
+    json!({
+        "rate_limit": {
+            "primary_window": window(&limits["primary"]),
+            "secondary_window": window(&limits["secondary"]),
+        },
+        "credits": limits["credits"],
+        "plan_type": limits["plan_type"],
+    })
 }
 
 /// Windows from the usage response. A window's length comes from
@@ -66,6 +157,7 @@ pub fn parse(body: &Value, now: i64) -> Result<Snapshot, Unavailable> {
             ..Credits::default()
         }),
         fetched_at: now,
+        origin: Origin::Provider,
     })
 }
 
@@ -113,7 +205,8 @@ fn number(value: &Value) -> Option<f64> {
 mod tests {
     use super::*;
     use crate::model::WindowKind;
-    use serde_json::json;
+    use crate::testing::TempDir;
+    use crate::tokens::tests::touch;
 
     const NOW: i64 = 1_795_444_270; // 2026-11-23T14:31:10Z
 
@@ -143,6 +236,186 @@ mod tests {
         ] {
             assert!(!text.contains(secret), "{secret} leaked");
         }
+    }
+
+    fn limits_line(at: i64, limits: Value) -> String {
+        json!({
+            "timestamp": time::format(at),
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": null, "rate_limits": limits},
+        })
+        .to_string()
+    }
+
+    fn monthly(used: f64) -> Value {
+        json!({
+            "limit_id": "codex", "limit_name": null,
+            "primary": {"used_percent": used, "window_minutes": 43200, "resets_at": 1_797_458_405},
+            "secondary": null,
+            "credits": {"has_credits": false, "unlimited": false, "balance": null},
+            "plan_type": "free",
+        })
+    }
+
+    /// A Codex home signed in with ChatGPT, with `rollouts` as (name, mtime,
+    /// lines).
+    fn rollouts(name: &str, files: &[(&str, i64, Vec<String>)]) -> (TempDir, Env) {
+        let dir = TempDir::new(name);
+        dir.write(
+            "home/.codex/auth.json",
+            r#"{"tokens": {"access_token": "secret-token", "account_id": "secret-account"}}"#,
+        );
+        for (file, mtime, lines) in files {
+            let path = dir.write(
+                &format!("home/.codex/sessions/2026/11/23/{file}"),
+                &(lines.join("\n") + "\n"),
+            );
+            touch(&path, *mtime);
+        }
+        let env = Env {
+            home: Some(dir.path().join("home")),
+            ..Env::default()
+        };
+        (dir, env)
+    }
+
+    #[test]
+    fn a_rollout_reading_reads_like_the_provider_answer() {
+        let (_dir, env) = rollouts(
+            "codex-saved-reads",
+            &[(
+                "rollout-a.jsonl",
+                NOW,
+                vec![limits_line(NOW - 90, monthly(10.0))],
+            )],
+        );
+        let snapshot = saved(&env, NOW).unwrap();
+        let answer = parse(&fixture(), NOW - 90).unwrap();
+        assert_eq!(snapshot.windows, answer.windows);
+        assert_eq!(snapshot.plan, answer.plan);
+        assert_eq!(snapshot.credits, answer.credits);
+        assert_eq!(
+            (snapshot.fetched_at, snapshot.origin),
+            (NOW - 90, Origin::Saved)
+        );
+        let text = snapshot.to_json().to_string();
+        assert!(!text.contains("secret"), "a sign-in leaked");
+    }
+
+    #[test]
+    fn lines_without_a_codex_reading_are_skipped() {
+        let mut other = monthly(50.0);
+        other["limit_id"] = json!("codex_other");
+        let mut no_primary = monthly(60.0);
+        no_primary["primary"] = Value::Null;
+        let mut unnamed = monthly(20.0);
+        unnamed["limit_id"] = Value::Null;
+        let (_dir, env) = rollouts(
+            "codex-saved-skips",
+            &[(
+                "rollout-a.jsonl",
+                NOW,
+                vec![
+                    limits_line(NOW - 50, unnamed),
+                    limits_line(NOW - 40, json!({"plan_type": "free"})),
+                    limits_line(NOW - 30, other),
+                    limits_line(NOW - 20, no_primary),
+                    "not json, but token_count and \"rate_limits\"".to_owned(),
+                ],
+            )],
+        );
+        let snapshot = saved(&env, NOW).unwrap();
+        assert_eq!(snapshot.fetched_at, NOW - 50);
+        assert_eq!(snapshot.windows[0].used_percent, 20.0);
+    }
+
+    #[test]
+    fn when_the_newest_rollout_has_no_reading_the_next_one_is_used() {
+        let (_dir, env) = rollouts(
+            "codex-saved-next",
+            &[
+                (
+                    "rollout-new.jsonl",
+                    NOW,
+                    vec![r#"{"type":"session_meta"}"#.to_owned()],
+                ),
+                (
+                    "rollout-old.jsonl",
+                    NOW - 600,
+                    vec![limits_line(NOW - 700, monthly(30.0))],
+                ),
+            ],
+        );
+        assert_eq!(saved(&env, NOW).unwrap().fetched_at, NOW - 700);
+    }
+
+    #[test]
+    fn with_equal_mtimes_the_newest_line_wins() {
+        let (_dir, env) = rollouts(
+            "codex-saved-equal",
+            &[
+                (
+                    "rollout-a.jsonl",
+                    NOW,
+                    vec![limits_line(NOW - 10, monthly(40.0))],
+                ),
+                (
+                    "rollout-b.jsonl",
+                    NOW,
+                    vec![limits_line(NOW - 99, monthly(41.0))],
+                ),
+            ],
+        );
+        assert_eq!(saved(&env, NOW).unwrap().windows[0].used_percent, 40.0);
+    }
+
+    #[test]
+    fn a_reading_from_the_future_is_ignored() {
+        let (_dir, env) = rollouts(
+            "codex-saved-future",
+            &[(
+                "rollout-a.jsonl",
+                NOW,
+                vec![
+                    limits_line(NOW - 10, monthly(1.0)),
+                    limits_line(NOW + 10, monthly(2.0)),
+                ],
+            )],
+        );
+        assert_eq!(saved(&env, NOW).unwrap().windows[0].used_percent, 1.0);
+    }
+
+    #[test]
+    fn only_the_end_of_a_long_rollout_is_read() {
+        let padding = format!(r#"{{"pad":"{}"}}"#, "x".repeat(TAIL_BYTES as usize));
+        let (_dir, env) = rollouts(
+            "codex-saved-tail",
+            &[(
+                "rollout-a.jsonl",
+                NOW,
+                vec![
+                    limits_line(NOW - 20, monthly(5.0)),
+                    padding,
+                    limits_line(NOW - 30, monthly(6.0)),
+                ],
+            )],
+        );
+        // The newer line sits before the last 256 KiB, so it isn't seen.
+        assert_eq!(saved(&env, NOW).unwrap().windows[0].used_percent, 6.0);
+    }
+
+    #[test]
+    fn a_saved_reading_needs_codex_signed_in() {
+        let (dir, env) = rollouts(
+            "codex-saved-signin",
+            &[(
+                "rollout-a.jsonl",
+                NOW,
+                vec![limits_line(NOW - 10, monthly(1.0))],
+            )],
+        );
+        std::fs::remove_file(dir.path().join("home/.codex/auth.json")).unwrap();
+        assert!(saved(&env, NOW).is_none());
     }
 
     #[test]

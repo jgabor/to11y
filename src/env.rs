@@ -12,6 +12,9 @@ pub struct Env {
     pub xdg_cache_home: Option<PathBuf>,
     pub claude_config_dir: Option<PathBuf>,
     pub codex_home: Option<PathBuf>,
+    /// `GEMINI_HOME`: the Gemini folder in place of `~/.gemini`. T3 Code
+    /// sets it for the agy it runs, and agy's children inherit it.
+    pub gemini_home: Option<PathBuf>,
     pub dbus_address: Option<String>,
     pub path: Option<OsString>,
     /// Set in the environment of the `agy` that to11y starts, so a to11y
@@ -39,6 +42,9 @@ pub struct Env {
     /// to11y.
     pub pid: Option<u32>,
     pub proc_dir: Option<PathBuf>,
+    /// Whether to11y runs one tool from the command line, so no harness
+    /// started it.
+    pub cli: bool,
 }
 
 impl Env {
@@ -69,6 +75,7 @@ impl Env {
             xdg_cache_home: dir("XDG_CACHE_HOME"),
             claude_config_dir: dir("CLAUDE_CONFIG_DIR"),
             codex_home: dir("CODEX_HOME"),
+            gemini_home: dir("GEMINI_HOME"),
             dbus_address: text("DBUS_SESSION_BUS_ADDRESS"),
             path: var("PATH").filter(|value| !value.is_empty()),
             no_agy: var("TO11Y_NO_AGY").is_some_and(|value| !value.is_empty()),
@@ -81,6 +88,7 @@ impl Env {
             started: None,
             pid: None,
             proc_dir: None,
+            cli: false,
         };
         if cfg!(debug_assertions) {
             env.now = text("TO11Y_NOW").and_then(|value| time::parse(&value));
@@ -103,6 +111,16 @@ impl Env {
             .or_else(|| self.in_home(".claude"))
     }
 
+    /// Claude Code's settings file, which also holds its last usage
+    /// reading: in `$CLAUDE_CONFIG_DIR` when that is set, else in the home
+    /// directory, not in `~/.claude`.
+    pub fn claude_json(&self) -> Option<PathBuf> {
+        match &self.claude_config_dir {
+            Some(dir) => Some(dir.join(".claude.json")),
+            None => self.in_home(".claude.json"),
+        }
+    }
+
     pub fn codex_dir(&self) -> Option<PathBuf> {
         self.codex_home.clone().or_else(|| self.in_home(".codex"))
     }
@@ -115,9 +133,25 @@ impl Env {
         self.in_home(".gemini/antigravity")
     }
 
-    /// Where the Antigravity CLI keeps its conversations.
-    pub fn antigravity_cli_dir(&self) -> Option<PathBuf> {
-        self.in_home(".gemini/antigravity-cli")
+    /// Where the Antigravity CLI keeps its conversations, and its sign-in
+    /// when it doesn't use the keyring: `antigravity-cli`, and
+    /// `antigravity-acp` for agy run as an ACP agent, as T3 Code runs it.
+    /// Each is looked for in `~/.gemini`, then in `GEMINI_HOME`. The first
+    /// is where a plain `agy` writes, since it ignores `GEMINI_HOME`.
+    pub fn antigravity_cli_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs = Vec::new();
+        for gemini in [self.in_home(".gemini"), self.gemini_home.clone()]
+            .into_iter()
+            .flatten()
+        {
+            for app in ["antigravity-cli", "antigravity-acp"] {
+                let dir = gemini.join(app);
+                if !dirs.contains(&dir) {
+                    dirs.push(dir);
+                }
+            }
+        }
+        dirs
     }
 
     /// When to11y started: the test clock if set, else the real start.
@@ -194,6 +228,26 @@ mod tests {
         assert_eq!(env.cache_dir(), Some("/home/u/.cache/to11y".into()));
         assert_eq!(env.harness, None);
         assert_eq!(super::Env::from_vars(|_| None).cache_dir(), None);
+    }
+
+    #[test]
+    fn antigravity_folders_include_gemini_home_once() {
+        let plain = env(&[("HOME", "/home/u")]);
+        assert_eq!(
+            plain.antigravity_cli_dirs(),
+            [
+                PathBuf::from("/home/u/.gemini/antigravity-cli"),
+                PathBuf::from("/home/u/.gemini/antigravity-acp"),
+            ]
+        );
+        let t3 = env(&[("HOME", "/home/u"), ("GEMINI_HOME", "/t3/profile")]);
+        assert_eq!(t3.antigravity_cli_dirs().len(), 4);
+        assert!(
+            t3.antigravity_cli_dirs()
+                .contains(&PathBuf::from("/t3/profile/antigravity-acp"))
+        );
+        let same = env(&[("HOME", "/home/u"), ("GEMINI_HOME", "/home/u/.gemini")]);
+        assert_eq!(same.antigravity_cli_dirs().len(), 2);
     }
 
     #[test]

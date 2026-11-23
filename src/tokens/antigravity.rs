@@ -1,11 +1,13 @@
 //! Antigravity CLI transcripts:
-//! `~/.gemini/antigravity-cli/brain/<conversation>/.system_generated/logs/`.
+//! `~/.gemini/antigravity-cli/brain/<conversation>/.system_generated/logs/`,
+//! and the same under each folder `Env::antigravity_cli_dirs` names, such as
+//! T3 Code's `antigravity-acp`.
 //!
 //! `transcript_full.jsonl` and its `chunks/transcript_full/*.jsonl` hold the
 //! same steps, so steps are deduplicated by conversation and step index.
 //! Only model steps carry usage, without a cache-write or reasoning split
-//! and without a working directory. These files appeared on Nov 21, 2026;
-//! older conversations are in encrypted or SQLite files to11y doesn't read.
+//! and without a working directory. Some machines have older conversations
+//! only in encrypted or SQLite files, which to11y doesn't read.
 
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -17,21 +19,20 @@ use crate::env::Env;
 use crate::time;
 
 pub fn files(env: &Env) -> Listing {
-    let Some(root) = env.antigravity_cli_dir().map(|dir| dir.join("brain")) else {
-        return Listing::default();
-    };
-    let mut files = Vec::new();
-    let Ok(conversations) = std::fs::read_dir(&root) else {
-        return Listing::default();
-    };
-    for conversation in conversations.flatten() {
-        files.extend(conversation_files(&conversation.path()));
+    let mut listing = Listing::default();
+    for root in env.antigravity_cli_dirs() {
+        let root = root.join("brain");
+        let Ok(conversations) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for conversation in conversations.flatten() {
+            listing
+                .files
+                .extend(conversation_files(&conversation.path()));
+        }
+        listing.roots.push(root);
     }
-    Listing {
-        root: Some(root),
-        files,
-        unsupported: 0,
-    }
+    listing
 }
 
 /// The transcript files of one conversation folder.
@@ -50,25 +51,28 @@ pub fn conversation_files(dir: &Path) -> Vec<FileInfo> {
     files
 }
 
-/// The conversation a transcript file belongs to: the folder under
-/// `brain/`.
-fn conversation(path: &Path) -> Option<&str> {
-    let mut parts = path.components().rev().map(|c| c.as_os_str().to_str());
+/// The folder under `brain/` that a transcript file belongs to.
+fn conversation_dir(path: &Path) -> Option<&Path> {
     // A main file is 3 levels below its conversation, a chunk 5.
     let up = if super::named(path, "transcript_full.jsonl") {
         3
     } else {
         5
     };
-    parts.nth(up)?
+    path.ancestors().nth(up)
 }
 
-/// The conversation folder holding the most recently written transcript.
+/// The conversation a transcript file belongs to: its folder's name.
+fn conversation(path: &Path) -> Option<&str> {
+    conversation_dir(path)?.file_name()?.to_str()
+}
+
+/// The conversation folder holding the most recently written transcript,
+/// in any of the CLI's folders.
 pub fn latest_conversation(env: &Env) -> Option<PathBuf> {
     let listing = files(env);
     let latest = listing.files.iter().max_by_key(|file| file.mtime)?;
-    let name = conversation(&latest.path)?;
-    Some(listing.root?.join(name))
+    conversation_dir(&latest.path).map(Path::to_path_buf)
 }
 
 pub fn parse(read: &mut dyn BufRead, path: &Path) -> Parsed {
@@ -148,10 +152,48 @@ mod tests {
         assert_eq!(scan.events.len(), 2);
         assert!(scan.events.iter().all(|e| e.session == "c1" && e.at == NOW));
         assert_eq!(scan.events[0].tokens.cache_read, 17_243);
+        assert_eq!(latest_conversation(&env), Some(listing.roots[0].join("c1")));
+    }
+
+    #[test]
+    fn t3_codes_conversations_under_gemini_home_count_too() {
+        let dir = TempDir::new("agy-t3-logs");
+        let logs = |root: &str, id: &str| format!("{root}/brain/{id}/.system_generated/logs");
+        let plain = dir.write(
+            &format!(
+                "{}/transcript_full.jsonl",
+                logs("home/.gemini/antigravity-cli", "c1")
+            ),
+            &step(1, 100),
+        );
+        let t3 = dir.write(
+            &format!(
+                "{}/transcript_full.jsonl",
+                logs("t3/antigravity-acp", "t3c")
+            ),
+            &step(1, 200),
+        );
+        crate::tokens::tests::touch(&plain, NOW - 60);
+        crate::tokens::tests::touch(&t3, NOW);
+        let env = Env {
+            home: Some(dir.path().join("home")),
+            gemini_home: Some(dir.path().join("t3")),
+            ..Env::default()
+        };
+        let listing = files(&env);
+        assert_eq!((listing.roots.len(), listing.files.len()), (2, 2));
+        let scan = scan_files(Harness::Antigravity, &listing.files);
+        let mut sessions: Vec<&str> = scan.events.iter().map(|e| e.session.as_str()).collect();
+        sessions.sort();
+        assert_eq!(sessions, ["c1", "t3c"]);
         assert_eq!(
             latest_conversation(&env),
-            Some(listing.root.unwrap().join("c1"))
+            Some(dir.path().join("t3/antigravity-acp/brain/t3c"))
         );
+        let (sources, error) = crate::tokens::report::sources(Harness::Antigravity, &env, NOW);
+        assert!(!error, "{sources}");
+        assert_eq!(sources["folders"].as_array().unwrap().len(), 2);
+        assert_eq!(sources["files"], 2);
     }
 
     #[test]

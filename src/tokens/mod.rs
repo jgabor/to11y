@@ -105,8 +105,9 @@ pub struct FileInfo {
 /// The log files of one harness.
 #[derive(Debug, Default)]
 pub struct Listing {
-    /// The folder the logs live in, if it exists.
-    pub root: Option<PathBuf>,
+    /// The folders the logs live in that exist. Antigravity may have more
+    /// than one.
+    pub roots: Vec<PathBuf>,
     pub files: Vec<FileInfo>,
     /// Files that look like logs but can't be read, such as compressed
     /// Codex rollouts.

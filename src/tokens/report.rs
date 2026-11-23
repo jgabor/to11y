@@ -105,13 +105,17 @@ pub fn session(harness: Harness, env: &Env, now: i64) -> Answer {
             let files = claude::session_files(env, &id);
             (scan_files(harness, &files).events, matched_by)
         }
-        Harness::Codex => match codex_session(env) {
-            Some(events) => (
+        Harness::Codex => match (codex_session(env), env.cli) {
+            (Some(events), false) => (
                 events,
                 "the Codex session in this directory that started to11y",
             ),
-            None => {
+            (Some(events), true) => (events, "the latest Codex session in this directory"),
+            (None, false) => {
                 return no_session(harness, "No Codex session in this directory started to11y.");
+            }
+            (None, true) => {
+                return no_session(harness, "No Codex session started in this directory.");
             }
         },
         Harness::Droid => {
@@ -164,6 +168,8 @@ pub fn session(harness: Harness, env: &Env, now: i64) -> Answer {
 /// Codex starts an MCP server in the session's directory, right after
 /// the session starts, and passes no session id. The match is the latest
 /// session in this directory that started before to11y did.
+/// The Codex session in to11y's directory that started to11y. From the
+/// command line, no session started it, so it is the latest one there.
 fn codex_session(env: &Env) -> Option<Vec<Event>> {
     let cwd = env.cwd.as_ref()?.to_str()?;
     let started = env.started();
@@ -173,7 +179,7 @@ fn codex_session(env: &Env) -> Option<Vec<Event>> {
     let candidates: Vec<_> = listing
         .files
         .iter()
-        .filter(|f| f.mtime >= started - 300)
+        .filter(|f| env.cli || f.mtime >= started - 300)
         .collect();
     let meta = candidates
         .iter()
@@ -282,10 +288,16 @@ fn best_scope<'a>(model: &str, scopes: &[&'a str]) -> Option<&'a str> {
 pub fn sources(harness: Harness, env: &Env, now: i64) -> Answer {
     let listing = list(harness, env);
     let mut out = header(harness);
-    let Some(root) = &listing.root else {
-        return unavailable(harness, env);
+    let folders: Vec<String> = listing
+        .roots
+        .iter()
+        .map(|root| display_path(root, env))
+        .collect();
+    match folders.as_slice() {
+        [] => return unavailable(harness, env),
+        [folder] => out.insert("folder".to_owned(), json!(folder)),
+        _ => out.insert("folders".to_owned(), json!(folders)),
     };
-    out.insert("folder".to_owned(), json!(display_path(root, env)));
     out.insert("files".to_owned(), json!(listing.files.len()));
     let ago = |at: i64| json!(format!("{} ago", time::duration(now - at)));
     if let Some(newest) = listing.files.iter().map(|f| f.mtime).max() {
@@ -307,9 +319,9 @@ fn coverage(harness: Harness) -> Option<&'static str> {
     match harness {
         Harness::ClaudeCode | Harness::Codex => None,
         Harness::Droid => Some("Droid's debug log is kept for about 45 days."),
-        Harness::Antigravity => Some(
-            "Only Antigravity CLI conversations since Nov 21, 2026 record tokens in a form to11y reads.",
-        ),
+        Harness::Antigravity => {
+            Some("Antigravity conversations that agy kept only in its .db files aren't counted.")
+        }
     }
 }
 
@@ -322,7 +334,7 @@ fn with_scan(
     period: Period,
     fill: impl FnOnce(&mut Map<String, Value>, &Scan),
 ) -> Answer {
-    if !root(harness, env).is_some_and(|root| root.is_dir()) {
+    if !roots(harness, env).iter().any(|root| root.is_dir()) {
         return unavailable(harness, env);
     }
     let found = scan(harness, env, now - period.seconds(), now);
@@ -346,13 +358,19 @@ fn with_scan(
     (Value::Object(out), false)
 }
 
-/// The folder a harness's logs live in, whether or not it exists.
-fn root(harness: Harness, env: &Env) -> Option<std::path::PathBuf> {
+/// The folders a harness's logs may live in, whether or not they exist.
+/// The first is the usual one.
+fn roots(harness: Harness, env: &Env) -> Vec<std::path::PathBuf> {
+    let one = |dir: Option<std::path::PathBuf>| dir.into_iter().collect();
     match harness {
-        Harness::ClaudeCode => env.claude_dir().map(|d| d.join("projects")),
-        Harness::Codex => env.codex_dir().map(|d| d.join("sessions")),
-        Harness::Droid => env.factory_dir().map(|d| d.join("logs")),
-        Harness::Antigravity => env.antigravity_cli_dir().map(|d| d.join("brain")),
+        Harness::ClaudeCode => one(env.claude_dir().map(|d| d.join("projects"))),
+        Harness::Codex => one(env.codex_dir().map(|d| d.join("sessions"))),
+        Harness::Droid => one(env.factory_dir().map(|d| d.join("logs"))),
+        Harness::Antigravity => env
+            .antigravity_cli_dirs()
+            .into_iter()
+            .map(|d| d.join("brain"))
+            .collect(),
     }
 }
 
@@ -363,7 +381,9 @@ fn header(harness: Harness) -> Map<String, Value> {
 }
 
 fn unavailable(harness: Harness, env: &Env) -> Answer {
-    let folder = root(harness, env).map(|root| display_path(&root, env));
+    let folder = roots(harness, env)
+        .first()
+        .map(|root| display_path(root, env));
     let mut out = header(harness);
     out.insert("unavailable".to_owned(), json!("no_logs"));
     out.insert(

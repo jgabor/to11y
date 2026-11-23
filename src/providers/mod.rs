@@ -63,6 +63,17 @@ pub fn fetch(harness: Harness, cx: &Context, now: i64) -> Result<Snapshot, Failu
     }
 }
 
+/// The reading the harness saved on disk the last time it asked its
+/// provider, for when to11y's own call fails or isn't needed. Only Claude
+/// Code and Codex save one.
+pub fn saved(harness: Harness, env: &Env, now: i64) -> Option<Snapshot> {
+    match harness {
+        Harness::ClaudeCode => claude::saved(env, now),
+        Harness::Codex => codex::saved(env, now),
+        Harness::Droid | Harness::Antigravity => None,
+    }
+}
+
 /// `fetch`, given up on after `deadline`. A fetch that is given up on
 /// finishes on its own thread, within its own timeouts, and is ignored.
 pub fn fetch_within(

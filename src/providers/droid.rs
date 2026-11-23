@@ -85,6 +85,7 @@ pub fn parse(body: &Value, now: i64) -> Result<Snapshot, Unavailable> {
             ..Credits::default()
         }),
         fetched_at: now,
+        origin: crate::model::Origin::Provider,
     })
 }
 

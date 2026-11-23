@@ -1,15 +1,23 @@
 //! Claude Code: Anthropic's OAuth usage endpoint, with the sign-in Claude
 //! Code stores in `.credentials.json`.
 
+use std::fmt;
+use std::io::{BufReader, Read};
+
+use serde::de::{self, Deserialize, Deserializer, IgnoredAny, MapAccess, Visitor};
 use serde_json::Value;
 
 use crate::creds;
-use crate::model::{Credits, Harness, Money, Snapshot, Unavailable};
+use crate::env::Env;
+use crate::model::{Credits, Harness, Money, Origin, Snapshot, Unavailable};
 use crate::pace::ALL;
 use crate::providers::{Context, Failure, request, slug, window};
 use crate::time;
 
 const URL: &str = "https://api.anthropic.com/api/oauth/usage";
+/// `.claude.json` grows with project history, so the cap is generous. The
+/// file is streamed and only two of its fields are kept.
+const MAX_SETTINGS_BYTES: u64 = 32 * 1024 * 1024;
 
 pub fn fetch(cx: &Context, now: i64) -> Result<Snapshot, Failure> {
     let login = creds::claude(&cx.env)?;
@@ -27,6 +35,96 @@ pub fn fetch(cx: &Context, now: i64) -> Result<Snapshot, Failure> {
     snapshot.plan = login.plan;
     snapshot.tier = login.tier;
     Ok(snapshot)
+}
+
+/// The usage answer Claude Code saved in `.claude.json` the last time it
+/// asked, as Claude Code's own `cachedUsageUtilization`. It counts only when
+/// it names the account signed in now, Claude Code is signed in, and it
+/// isn't from the future. The account ids are compared, then dropped.
+pub fn saved(env: &Env, now: i64) -> Option<Snapshot> {
+    let login = creds::claude(env).ok()?;
+    let file = std::fs::File::open(env.claude_json()?).ok()?;
+    let reader = BufReader::new(file.take(MAX_SETTINGS_BYTES));
+    let settings =
+        Settings::deserialize(&mut serde_json::Deserializer::from_reader(reader)).ok()?;
+    let saved = settings.saved?;
+    let signed_in = settings.account?;
+    if saved["accountUuid"].as_str() != Some(signed_in.as_str()) {
+        return None;
+    }
+    let fetched_at = saved["fetchedAtMs"].as_i64()?.div_euclid(1000);
+    if fetched_at > now {
+        return None;
+    }
+    let mut snapshot = parse(&saved["utilization"], fetched_at).ok()?;
+    snapshot.plan = login.plan;
+    snapshot.tier = login.tier;
+    snapshot.origin = Origin::Saved;
+    Some(snapshot)
+}
+
+/// The two parts of `.claude.json` to11y reads. Everything else, such as
+/// the user's name and email, is skipped without being kept.
+#[derive(Default)]
+struct Settings {
+    saved: Option<Value>,
+    account: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for Settings {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Top;
+        impl<'de> Visitor<'de> for Top {
+            type Value = Settings;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("an object")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Settings, A::Error> {
+                let mut settings = Settings::default();
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "cachedUsageUtilization" => settings.saved = Some(map.next_value()?),
+                        "oauthAccount" => settings.account = map.next_value::<Account>()?.0,
+                        _ => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(settings)
+            }
+        }
+        deserializer.deserialize_map(Top)
+    }
+}
+
+/// `oauthAccount.accountUuid`, and nothing else of `oauthAccount`.
+struct Account(Option<String>);
+
+impl<'de> Deserialize<'de> for Account {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Fields;
+        impl<'de> Visitor<'de> for Fields {
+            type Value = Account;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("an object or null")
+            }
+            fn visit_unit<E: de::Error>(self) -> Result<Account, E> {
+                Ok(Account(None))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Account, A::Error> {
+                let mut id = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "accountUuid" {
+                        id = map.next_value::<Option<String>>()?;
+                    } else {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(Account(id))
+            }
+        }
+        deserializer.deserialize_any(Fields)
+    }
 }
 
 /// Windows from the usage response. `five_hour` and `seven_day` limit
@@ -98,6 +196,7 @@ pub fn parse(body: &Value, now: i64) -> Result<Snapshot, Unavailable> {
         windows,
         credits: credits(body),
         fetched_at: now,
+        origin: crate::model::Origin::Provider,
     })
 }
 
@@ -235,6 +334,131 @@ mod tests {
         assert_eq!(credits.limit.unwrap().amount, 10.0);
         assert_eq!(credits.used.unwrap().currency, "EUR");
         assert_eq!(credits.note.as_deref(), Some("out_of_credits"));
+    }
+
+    /// A home where Claude Code is signed in and saved `fetched_ms` as its
+    /// last reading, for account `saved_for`, while `signed_in` is signed in.
+    fn saved_home(
+        name: &str,
+        saved_for: &str,
+        signed_in: &str,
+        fetched_ms: i64,
+    ) -> crate::testing::TempDir {
+        let dir = crate::testing::TempDir::new(name);
+        dir.write(
+            "home/.claude/.credentials.json",
+            r#"{"claudeAiOauth":{"accessToken":"tok","subscriptionType":"max"}}"#,
+        );
+        let settings = json!({
+            "numStartups": 12,
+            "oauthAccount": {
+                "accountUuid": signed_in,
+                "emailAddress": "planted@example.invalid",
+                "displayName": "Planted Name",
+            },
+            "projects": {"/home/planted/secret-project": {"history": []}},
+            "cachedUsageUtilization": {
+                "fetchedAtMs": fetched_ms,
+                "accountUuid": saved_for,
+                "utilization": fixture(),
+            },
+        });
+        dir.write("home/.claude.json", &settings.to_string());
+        dir
+    }
+
+    fn home_env(dir: &crate::testing::TempDir) -> Env {
+        Env {
+            home: Some(dir.path().join("home")),
+            ..Env::default()
+        }
+    }
+
+    #[test]
+    fn claude_codes_saved_reading_reads_like_the_provider_answer() {
+        let dir = saved_home(
+            "claude-saved-reads",
+            "acct-1",
+            "acct-1",
+            (NOW - 90) * 1000 + 500,
+        );
+        let snapshot = saved(&home_env(&dir), NOW).unwrap();
+        let answer = parse(&fixture(), NOW - 90).unwrap();
+        assert_eq!(snapshot.windows, answer.windows);
+        assert_eq!(snapshot.fetched_at, NOW - 90);
+        assert_eq!(snapshot.origin, Origin::Saved);
+        assert_eq!(snapshot.plan.as_deref(), Some("max"));
+        let text = snapshot.to_json().to_string();
+        for planted in ["acct-1", "planted", "Planted", "secret-project"] {
+            assert!(!text.contains(planted), "{planted} leaked");
+        }
+    }
+
+    #[test]
+    fn a_saved_reading_for_another_account_is_ignored() {
+        let dir = saved_home(
+            "claude-saved-account",
+            "acct-old",
+            "acct-new",
+            (NOW - 90) * 1000,
+        );
+        assert_eq!(saved(&home_env(&dir), NOW), None);
+    }
+
+    #[test]
+    fn a_saved_reading_from_the_future_is_ignored() {
+        let dir = saved_home("claude-saved-future", "acct-1", "acct-1", (NOW + 90) * 1000);
+        assert_eq!(saved(&home_env(&dir), NOW), None);
+    }
+
+    #[test]
+    fn a_saved_reading_needs_claude_code_signed_in() {
+        let dir = saved_home("claude-saved-signin", "acct-1", "acct-1", (NOW - 90) * 1000);
+        std::fs::remove_file(dir.path().join("home/.claude/.credentials.json")).unwrap();
+        assert_eq!(saved(&home_env(&dir), NOW), None);
+    }
+
+    #[test]
+    fn a_damaged_or_accountless_settings_file_gives_no_reading() {
+        let dir = saved_home(
+            "claude-saved-damaged",
+            "acct-1",
+            "acct-1",
+            (NOW - 90) * 1000,
+        );
+        dir.write(
+            "home/.claude.json",
+            r#"{"cachedUsageUtilization": {"fetchedAtMs": 1"#,
+        );
+        assert_eq!(saved(&home_env(&dir), NOW), None);
+        dir.write(
+            "home/.claude.json",
+            r#"{"oauthAccount": null, "cachedUsageUtilization": {"fetchedAtMs": 1, "accountUuid": "a"}}"#,
+        );
+        assert_eq!(saved(&home_env(&dir), NOW), None);
+    }
+
+    #[test]
+    fn the_settings_file_follows_claude_config_dir() {
+        let dir = saved_home("claude-saved-config", "acct-1", "acct-1", (NOW - 90) * 1000);
+        let config = dir.path().join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::rename(
+            dir.path().join("home/.claude.json"),
+            config.join(".claude.json"),
+        )
+        .unwrap();
+        std::fs::rename(dir.path().join("home/.claude"), config.join("creds")).unwrap();
+        std::fs::rename(
+            config.join("creds/.credentials.json"),
+            config.join(".credentials.json"),
+        )
+        .unwrap();
+        let env = Env {
+            claude_config_dir: Some(config),
+            ..home_env(&dir)
+        };
+        assert!(saved(&env, NOW).is_some());
     }
 
     #[test]

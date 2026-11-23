@@ -1,4 +1,4 @@
-//! The ten tools. Each answers one question, so an agent searching for a
+//! The seventeen tools. Each answers one question, so an agent searching for a
 //! tool finds the one that answers it. Results are compact JSON in a text
 //! block, with relative times so the agent does no date math.
 
@@ -11,7 +11,7 @@ use crate::cache::{Cache, Reading};
 use crate::creds::{self, Keyring, SecretService};
 use crate::env::Env;
 use crate::http;
-use crate::model::{Harness, Snapshot, Unavailable};
+use crate::model::{Harness, Origin, Snapshot, Unavailable};
 use crate::pace::{self, Assessed, Scope, Verdict};
 use crate::providers::{self, Context};
 use crate::time;
@@ -155,6 +155,17 @@ pub fn exists(name: &str) -> bool {
     TOOLS.iter().any(|tool| tool.name == name)
 }
 
+/// Checks `arguments` for the tool `name` the way a call would, and says
+/// whether the tool takes a harness.
+pub fn check(name: &str, arguments: &Value) -> Result<bool, String> {
+    let tool = TOOLS
+        .iter()
+        .find(|tool| tool.name == name)
+        .ok_or_else(|| format!("Unknown tool: {name}"))?;
+    parse_arguments(tool, arguments)?;
+    Ok(tool.args.harness())
+}
+
 /// The `tools/list` result.
 pub fn list() -> Value {
     let names: Vec<&str> = Harness::ALL.iter().map(|h| h.name()).collect();
@@ -274,6 +285,19 @@ impl Tools {
                 }),
             );
         }
+        if snapshot.origin == Origin::Saved {
+            out.insert(
+                "saved_copy".to_owned(),
+                json!({
+                    "age": time::duration(now - snapshot.fetched_at),
+                    "message": format!(
+                        "This is the reading {} saved, not one to11y asked {} for.",
+                        harness.name(),
+                        harness.provider(),
+                    ),
+                }),
+            );
+        }
         if name == "token_usage_limit_windows" {
             out.extend(report::limit_windows(harness, env, now, snapshot));
             return result(Value::Object(out), false);
@@ -324,9 +348,12 @@ impl Tools {
 
     fn reading(&self, harness: Harness, now: i64) -> Reading {
         let cx = self.context();
-        self.cache.get(harness, now, || {
-            providers::fetch_within(harness, cx, now, providers::DEADLINE)
-        })
+        self.cache.get(
+            harness,
+            now,
+            || providers::saved(harness, &self.env, now),
+            || providers::fetch_within(harness, cx, now, providers::DEADLINE),
+        )
     }
 
     fn all_harnesses(&self, now: i64) -> Value {
@@ -355,6 +382,12 @@ impl Tools {
                             out.insert(
                                 "stale".to_owned(),
                                 json!({ "age": time::duration(now - snapshot.fetched_at), "reason": why.kind() }),
+                            );
+                        }
+                        if snapshot.origin == Origin::Saved {
+                            out.insert(
+                                "saved_copy".to_owned(),
+                                json!({ "age": time::duration(now - snapshot.fetched_at) }),
                             );
                         }
                         let (assessed, scopes) = pace::assess(&snapshot.windows, now);
@@ -427,6 +460,14 @@ impl Tools {
                 last.insert(
                     "last_good_reading_age".to_owned(),
                     json!(time::duration(now - snapshot.fetched_at)),
+                );
+            }
+            if let Some(snapshot) = &reading.snapshot
+                && snapshot.origin == Origin::Saved
+            {
+                last.insert(
+                    "reading_from".to_owned(),
+                    json!(format!("the copy {} saved", harness.name())),
                 );
             }
             out.insert("last_check".to_owned(), Value::Object(last));
@@ -899,6 +940,56 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_call_shows_the_reading_the_harness_saved() {
+        let dir = crate::testing::TempDir::new("tools-saved");
+        dir.write(
+            "fixtures/claude-code.json",
+            r#"{"to11y_unavailable": {"kind": "failed", "detail": "Anthropic answered with HTTP 429."}}"#,
+        );
+        dir.write(
+            "home/.claude/.credentials.json",
+            r#"{"claudeAiOauth":{"accessToken":"secret-token","subscriptionType":"max"}}"#,
+        );
+        let utilization: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/claude-code.json")).unwrap();
+        let settings = json!({
+            "oauthAccount": {"accountUuid": "secret-account", "emailAddress": "planted@example.invalid"},
+            "cachedUsageUtilization": {
+                "fetchedAtMs": (NOW - 600) * 1000,
+                "accountUuid": "secret-account",
+                "utilization": utilization,
+            },
+        });
+        dir.write("home/.claude.json", &settings.to_string());
+        let tools = Tools::new(Env {
+            now: Some(NOW),
+            home: Some(dir.path().join("home")),
+            fixtures: Some(dir.path().join("fixtures")),
+            ..Env::default()
+        });
+        let (out, error) = call(&tools, "usage_limits", json!({"harness": "claude-code"}));
+        assert!(!error, "{out}");
+        assert_eq!(out["saved_copy"]["age"], "10m");
+        assert_eq!(out["stale"]["reason"], "failed");
+        assert!(out["windows"].as_array().is_some_and(|w| !w.is_empty()));
+        let (all, _) = call(&tools, "usage_limits_all_harnesses", Value::Null);
+        assert_eq!(all["harnesses"][0]["saved_copy"]["age"], "10m");
+        let (status, _) = call(
+            &tools,
+            "usage_login_status",
+            json!({"harness": "claude-code"}),
+        );
+        assert_eq!(
+            status["last_check"]["reading_from"],
+            "the copy claude-code saved"
+        );
+        for text in [out, all, status].map(|v| v.to_string()) {
+            assert!(!text.contains("secret"), "a sign-in leaked: {text}");
+            assert!(!text.contains("planted"), "settings leaked: {text}");
+        }
+    }
+
+    #[test]
     fn percents_have_one_decimal_place_at_most() {
         assert_eq!(percent(6.0), json!(6));
         assert_eq!(percent(0.006664), json!(0));
@@ -1110,6 +1201,39 @@ mod tests {
         let (out, error) = call(&tools, "token_usage_session", json!({"harness": "codex"}));
         assert!(error);
         assert_eq!(out["unavailable"], "no_session");
+    }
+
+    #[test]
+    fn from_the_command_line_the_codex_session_is_the_latest_in_its_directory() {
+        let (dir, _) = log_tools();
+        // Long after the rollout last changed, so no running Codex
+        // session could have started to11y.
+        let later = NOW + 40 * 86_400;
+        let env = |cli| Env {
+            home: Some(dir.path().join("home")),
+            now: Some(later),
+            started: Some(later),
+            cwd: Some("/work/app".into()),
+            cli,
+            ..Env::default()
+        };
+        let (out, error) = call(
+            &Tools::new(env(false)),
+            "token_usage_session",
+            json!({"harness": "codex"}),
+        );
+        assert!(error, "{out}");
+        let (out, error) = call(
+            &Tools::new(env(true)),
+            "token_usage_session",
+            json!({"harness": "codex"}),
+        );
+        assert!(!error, "{out}");
+        assert_eq!(
+            out["matched_by"],
+            "the latest Codex session in this directory"
+        );
+        assert_eq!(out["tokens"]["requests"], 3);
     }
 
     #[test]

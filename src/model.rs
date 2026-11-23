@@ -165,6 +165,25 @@ pub struct Credits {
     pub note: Option<String>,
 }
 
+/// Where a snapshot came from.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Origin {
+    /// to11y asked the provider.
+    #[default]
+    Provider,
+    /// The reading the harness saved on disk the last time it asked.
+    Saved,
+}
+
+impl Origin {
+    pub fn name(self) -> &'static str {
+        match self {
+            Origin::Provider => "provider",
+            Origin::Saved => "saved",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Snapshot {
     pub harness: Harness,
@@ -174,6 +193,7 @@ pub struct Snapshot {
     pub credits: Option<Credits>,
     /// Unix seconds.
     pub fetched_at: i64,
+    pub origin: Origin,
 }
 
 /// Why a harness has no current reading.
@@ -316,6 +336,7 @@ impl Snapshot {
             "windows": windows,
             "credits": self.credits.as_ref().map(Credits::to_json),
             "fetched_at": self.fetched_at,
+            "origin": self.origin.name(),
         })
     }
 
@@ -348,6 +369,11 @@ impl Snapshot {
                 .filter(|c| c.is_object())
                 .map(Credits::from_json),
             fetched_at: value["fetched_at"].as_i64()?,
+            // Readings cached before origins were kept came from providers.
+            origin: match value["origin"].as_str() {
+                Some("saved") => Origin::Saved,
+                _ => Origin::Provider,
+            },
         })
     }
 }
@@ -413,10 +439,15 @@ mod tests {
                 ..Credits::default()
             }),
             fetched_at: 1_799_999_000,
+            origin: Origin::Saved,
         };
         let text = snapshot.to_json().to_string();
         let back = Snapshot::from_json(&serde_json::from_str(&text).unwrap()).unwrap();
         assert_eq!(back, snapshot);
+        // A cache file written before origins were kept.
+        let mut old = snapshot.to_json();
+        old.as_object_mut().unwrap().remove("origin");
+        assert_eq!(Snapshot::from_json(&old).unwrap().origin, Origin::Provider);
     }
 
     #[test]

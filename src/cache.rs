@@ -58,24 +58,57 @@ impl Cache {
     /// The reading for `harness`, calling `fetch` only when the last
     /// attempt is older than its hold: `fresh_for(harness)`, or longer when
     /// a failing provider sent `Retry-After`.
+    ///
+    /// `saved` is the reading the harness itself saved on disk, if any. It
+    /// takes the place of an older snapshot after a failure, whether or not
+    /// a call is made, so a held failure can still show a newer reading. For
+    /// Claude Code, whose saved reading is the provider's whole answer, it
+    /// also replaces an older good one, and one younger than the hold is
+    /// used without a call.
     pub fn get(
         &self,
         harness: Harness,
         now: i64,
+        saved: impl FnOnce() -> Option<Snapshot>,
         fetch: impl FnOnce() -> Result<Snapshot, Failure>,
     ) -> Reading {
         let mut slot = self.slot(harness);
         let last = newest(self.load(harness), slot.take());
+        let saved = saved().filter(|s| s.harness == harness && s.fetched_at <= now);
+        let fresh = fresh_for(harness);
         if let Some(reading) = &last {
-            let fresh = fresh_for(harness);
             let hold = match reading.failure {
                 None => fresh,
                 Some(_) => reading.retry_after.unwrap_or(0).max(fresh),
             };
             if (0..hold).contains(&(now - reading.checked_at)) {
-                *slot = last.clone();
-                return last.expect("checked above");
+                let mut reading = reading.clone();
+                let replaceable = reading.failure.is_some() || uses_saved_without_a_call(harness);
+                if let Some(newer) = newer_than(saved, reading.snapshot.as_ref())
+                    && replaceable
+                {
+                    reading.snapshot = Some(newer);
+                    self.store(harness, &reading);
+                }
+                *slot = Some(reading.clone());
+                return reading;
             }
+        }
+        if let Some(snapshot) = saved
+            .as_ref()
+            .filter(|s| uses_saved_without_a_call(harness) && now - s.fetched_at < fresh)
+        {
+            // Held from when the harness asked, not from now, so it is never
+            // reused for longer than a reading to11y fetched itself.
+            let reading = Reading {
+                snapshot: Some(snapshot.clone()),
+                failure: None,
+                checked_at: snapshot.fetched_at,
+                retry_after: None,
+            };
+            self.store(harness, &reading);
+            *slot = Some(reading.clone());
+            return reading;
         }
         let reading = match fetch() {
             Ok(snapshot) => Reading {
@@ -84,12 +117,15 @@ impl Cache {
                 checked_at: now,
                 retry_after: None,
             },
-            Err(failure) => Reading {
-                snapshot: last.and_then(|reading| reading.snapshot),
-                failure: Some(failure.why),
-                checked_at: now,
-                retry_after: failure.retry_after,
-            },
+            Err(failure) => {
+                let last = last.and_then(|reading| reading.snapshot);
+                Reading {
+                    snapshot: newer_than(saved, last.as_ref()).or(last),
+                    failure: Some(failure.why),
+                    checked_at: now,
+                    retry_after: failure.retry_after,
+                }
+            }
         };
         self.store(harness, &reading);
         *slot = Some(reading.clone());
@@ -174,6 +210,18 @@ impl Cache {
     }
 }
 
+/// Whether a fresh saved reading stands in for a call. Only Claude Code:
+/// Anthropic limits how often its usage endpoint is asked, and Claude Code
+/// asks it too. Codex's saved reading lacks some of the provider's windows.
+fn uses_saved_without_a_call(harness: Harness) -> bool {
+    harness == Harness::ClaudeCode
+}
+
+/// `saved`, when it is newer than `current` or there is no `current`.
+fn newer_than(saved: Option<Snapshot>, current: Option<&Snapshot>) -> Option<Snapshot> {
+    saved.filter(|s| current.is_none_or(|c| s.fetched_at > c.fetched_at))
+}
+
 /// The later of two readings.
 fn newest(a: Option<Reading>, b: Option<Reading>) -> Option<Reading> {
     match (a, b) {
@@ -218,6 +266,15 @@ mod tests {
             }],
             credits: None,
             fetched_at: at,
+            origin: crate::model::Origin::Provider,
+        }
+    }
+
+    fn saved_copy(harness: Harness, used: f64, at: i64) -> Snapshot {
+        Snapshot {
+            harness,
+            origin: crate::model::Origin::Saved,
+            ..snapshot(used, at)
         }
     }
 
@@ -232,10 +289,20 @@ mod tests {
     fn a_reading_is_reused_for_a_minute() {
         let dir = TempDir::new("cache-fresh");
         let cache = cache(&dir);
-        let first = cache.get(Harness::Codex, NOW, || Ok(snapshot(10.0, NOW)));
-        let again = cache.get(Harness::Codex, NOW + 59, || panic!("fetched while fresh"));
+        let first = cache.get(Harness::Codex, NOW, || None, || Ok(snapshot(10.0, NOW)));
+        let again = cache.get(
+            Harness::Codex,
+            NOW + 59,
+            || None,
+            || panic!("fetched while fresh"),
+        );
         assert_eq!(again, first);
-        let later = cache.get(Harness::Codex, NOW + 60, || Ok(snapshot(20.0, NOW + 60)));
+        let later = cache.get(
+            Harness::Codex,
+            NOW + 60,
+            || None,
+            || Ok(snapshot(20.0, NOW + 60)),
+        );
         assert_eq!(later.snapshot.unwrap().windows[0].used_percent, 20.0);
     }
 
@@ -243,26 +310,50 @@ mod tests {
     fn a_claude_reading_or_failure_is_reused_for_five_minutes() {
         let dir = TempDir::new("cache-fresh-claude");
         let cache = cache(&dir);
-        cache.get(Harness::ClaudeCode, NOW, || Ok(snapshot(10.0, NOW)));
-        cache.get(Harness::ClaudeCode, NOW + 299, || {
-            panic!("fetched while fresh")
-        });
-        cache.get(Harness::ClaudeCode, NOW + 300, || Err(failed(Some(30))));
-        cache.get(Harness::ClaudeCode, NOW + 599, || {
-            panic!("fetched during the hold")
-        });
-        let reading = cache.get(Harness::ClaudeCode, NOW + 600, || {
-            Ok(snapshot(20.0, NOW + 600))
-        });
+        cache.get(
+            Harness::ClaudeCode,
+            NOW,
+            || None,
+            || Ok(snapshot(10.0, NOW)),
+        );
+        cache.get(
+            Harness::ClaudeCode,
+            NOW + 299,
+            || None,
+            || panic!("fetched while fresh"),
+        );
+        cache.get(
+            Harness::ClaudeCode,
+            NOW + 300,
+            || None,
+            || Err(failed(Some(30))),
+        );
+        cache.get(
+            Harness::ClaudeCode,
+            NOW + 599,
+            || None,
+            || panic!("fetched during the hold"),
+        );
+        let reading = cache.get(
+            Harness::ClaudeCode,
+            NOW + 600,
+            || None,
+            || Ok(snapshot(20.0, NOW + 600)),
+        );
         assert_eq!(reading.failure, None);
     }
 
     #[test]
     fn another_process_reads_the_same_file() {
         let dir = TempDir::new("cache-shared");
-        cache(&dir).get(Harness::Codex, NOW, || Ok(snapshot(10.0, NOW)));
+        cache(&dir).get(Harness::Codex, NOW, || None, || Ok(snapshot(10.0, NOW)));
         let other = cache(&dir);
-        let reading = other.get(Harness::Codex, NOW + 30, || panic!("fetched while fresh"));
+        let reading = other.get(
+            Harness::Codex,
+            NOW + 30,
+            || None,
+            || panic!("fetched while fresh"),
+        );
         assert_eq!(reading.snapshot, Some(snapshot(10.0, NOW)));
     }
 
@@ -270,8 +361,8 @@ mod tests {
     fn a_failure_keeps_the_last_good_snapshot_as_stale() {
         let dir = TempDir::new("cache-stale");
         let cache = cache(&dir);
-        cache.get(Harness::Codex, NOW, || Ok(snapshot(10.0, NOW)));
-        let reading = cache.get(Harness::Codex, NOW + 120, || Err(failed(None)));
+        cache.get(Harness::Codex, NOW, || None, || Ok(snapshot(10.0, NOW)));
+        let reading = cache.get(Harness::Codex, NOW + 120, || None, || Err(failed(None)));
         assert_eq!(reading.snapshot, Some(snapshot(10.0, NOW)));
         assert!(matches!(reading.failure, Some(Unavailable::Failed(_))));
         assert_eq!(reading.checked_at, NOW + 120);
@@ -281,15 +372,26 @@ mod tests {
     fn a_failure_is_held_for_a_minute_or_for_retry_after() {
         let dir = TempDir::new("cache-hold");
         let cache = cache(&dir);
-        cache.get(Harness::Codex, NOW, || Err(failed(None)));
-        cache.get(Harness::Codex, NOW + 59, || {
-            panic!("fetched during the hold")
-        });
-        cache.get(Harness::Codex, NOW + 60, || Err(failed(Some(300))));
-        cache.get(Harness::Codex, NOW + 359, || {
-            panic!("fetched before Retry-After")
-        });
-        let reading = cache.get(Harness::Codex, NOW + 360, || Ok(snapshot(5.0, NOW + 360)));
+        cache.get(Harness::Codex, NOW, || None, || Err(failed(None)));
+        cache.get(
+            Harness::Codex,
+            NOW + 59,
+            || None,
+            || panic!("fetched during the hold"),
+        );
+        cache.get(Harness::Codex, NOW + 60, || None, || Err(failed(Some(300))));
+        cache.get(
+            Harness::Codex,
+            NOW + 359,
+            || None,
+            || panic!("fetched before Retry-After"),
+        );
+        let reading = cache.get(
+            Harness::Codex,
+            NOW + 360,
+            || None,
+            || Ok(snapshot(5.0, NOW + 360)),
+        );
         assert_eq!(reading.failure, None);
     }
 
@@ -297,10 +399,13 @@ mod tests {
     fn a_reading_from_the_future_is_not_trusted() {
         let dir = TempDir::new("cache-future");
         let cache = cache(&dir);
-        cache.get(Harness::Codex, NOW + 1000, || {
-            Ok(snapshot(10.0, NOW + 1000))
-        });
-        let reading = cache.get(Harness::Codex, NOW, || Ok(snapshot(20.0, NOW)));
+        cache.get(
+            Harness::Codex,
+            NOW + 1000,
+            || None,
+            || Ok(snapshot(10.0, NOW + 1000)),
+        );
+        let reading = cache.get(Harness::Codex, NOW, || None, || Ok(snapshot(20.0, NOW)));
         assert_eq!(reading.snapshot.unwrap().windows[0].used_percent, 20.0);
     }
 
@@ -312,11 +417,16 @@ mod tests {
         std::thread::scope(|scope| {
             for _ in 0..10 {
                 scope.spawn(|| {
-                    cache.get(Harness::Codex, NOW, || {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                        Ok(snapshot(10.0, NOW))
-                    })
+                    cache.get(
+                        Harness::Codex,
+                        NOW,
+                        || None,
+                        || {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                            Ok(snapshot(10.0, NOW))
+                        },
+                    )
                 });
             }
         });
@@ -326,7 +436,7 @@ mod tests {
     #[test]
     fn files_are_private_to_their_owner() {
         let dir = TempDir::new("cache-modes");
-        cache(&dir).get(Harness::Codex, NOW, || Ok(snapshot(10.0, NOW)));
+        cache(&dir).get(Harness::Codex, NOW, || None, || Ok(snapshot(10.0, NOW)));
         let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&dir.path().join("to11y")), 0o700);
         assert_eq!(mode(&dir.path().join("to11y/codex.json")), 0o600);
@@ -353,10 +463,172 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_saved_claude_reading_makes_no_call() {
+        let dir = TempDir::new("cache-saved-fresh");
+        let cache = cache(&dir);
+        let copy = saved_copy(Harness::ClaudeCode, 30.0, NOW - 100);
+        let reading = cache.get(
+            Harness::ClaudeCode,
+            NOW,
+            || Some(copy.clone()),
+            || panic!("fetched with a fresh saved reading"),
+        );
+        assert_eq!((reading.snapshot, reading.failure), (Some(copy), None));
+        cache.get(
+            Harness::ClaudeCode,
+            NOW + 199,
+            || None,
+            || panic!("fetched while fresh"),
+        );
+        let later = cache.get(
+            Harness::ClaudeCode,
+            NOW + 200,
+            || None,
+            || Ok(snapshot(40.0, NOW + 200)),
+        );
+        assert_eq!(later.snapshot.unwrap().windows[0].used_percent, 40.0);
+    }
+
+    #[test]
+    fn an_old_saved_claude_reading_or_any_codex_one_still_calls() {
+        let dir = TempDir::new("cache-saved-calls");
+        let cache = cache(&dir);
+        let calls = AtomicUsize::new(0);
+        let fetch = |harness| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Snapshot {
+                harness,
+                ..snapshot(50.0, NOW)
+            })
+        };
+        let old = saved_copy(Harness::ClaudeCode, 30.0, NOW - 300);
+        let claude = cache.get(
+            Harness::ClaudeCode,
+            NOW,
+            || Some(old),
+            || fetch(Harness::ClaudeCode),
+        );
+        let fresh = saved_copy(Harness::Codex, 30.0, NOW - 1);
+        let codex = cache.get(
+            Harness::Codex,
+            NOW,
+            || Some(fresh),
+            || fetch(Harness::Codex),
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        for reading in [claude, codex] {
+            let snapshot = reading.snapshot.unwrap();
+            assert_eq!(snapshot.origin, crate::model::Origin::Provider);
+        }
+    }
+
+    #[test]
+    fn a_held_failure_shows_a_newer_saved_reading() {
+        let dir = TempDir::new("cache-saved-held");
+        let cache = cache(&dir);
+        cache.get(Harness::Codex, NOW, || None, || Err(failed(Some(3600))));
+        let copy = saved_copy(Harness::Codex, 30.0, NOW + 100);
+        let reading = cache.get(
+            Harness::Codex,
+            NOW + 200,
+            || Some(copy.clone()),
+            || panic!("fetched before Retry-After"),
+        );
+        assert_eq!(reading.snapshot, Some(copy.clone()));
+        assert!(reading.failure.is_some());
+        let older = saved_copy(Harness::Codex, 20.0, NOW + 50);
+        let again = cache.get(
+            Harness::Codex,
+            NOW + 300,
+            || Some(older),
+            || panic!("fetched before Retry-After"),
+        );
+        assert_eq!(again.snapshot, Some(copy));
+    }
+
+    #[test]
+    fn a_good_codex_reading_is_not_replaced_by_its_saved_copy() {
+        let dir = TempDir::new("cache-saved-good");
+        let cache = cache(&dir);
+        cache.get(Harness::Codex, NOW, || None, || Ok(snapshot(10.0, NOW)));
+        let reading = cache.get(
+            Harness::Codex,
+            NOW + 30,
+            || Some(saved_copy(Harness::Codex, 30.0, NOW + 20)),
+            || panic!("fetched while fresh"),
+        );
+        assert_eq!(reading.snapshot, Some(snapshot(10.0, NOW)));
+    }
+
+    #[test]
+    fn a_failed_fetch_falls_back_to_a_newer_saved_reading() {
+        let dir = TempDir::new("cache-saved-failed");
+        let cache = cache(&dir);
+        cache.get(Harness::Codex, NOW, || None, || Ok(snapshot(10.0, NOW)));
+        let older = saved_copy(Harness::Codex, 5.0, NOW - 10);
+        let reading = cache.get(
+            Harness::Codex,
+            NOW + 120,
+            || Some(older),
+            || Err(failed(None)),
+        );
+        assert_eq!(reading.snapshot, Some(snapshot(10.0, NOW)));
+        let newer = saved_copy(Harness::Codex, 30.0, NOW + 150);
+        let reading = cache.get(
+            Harness::Codex,
+            NOW + 240,
+            || Some(newer.clone()),
+            || Err(failed(None)),
+        );
+        assert_eq!(reading.snapshot, Some(newer));
+        assert!(reading.failure.is_some());
+    }
+
+    #[test]
+    fn a_saved_reading_for_another_harness_or_from_the_future_is_ignored() {
+        let dir = TempDir::new("cache-saved-ignored");
+        let cache = cache(&dir);
+        let reading = cache.get(
+            Harness::Codex,
+            NOW,
+            || Some(saved_copy(Harness::Droid, 30.0, NOW - 5)),
+            || Err(failed(None)),
+        );
+        assert_eq!(reading.snapshot, None);
+        let reading = cache.get(
+            Harness::ClaudeCode,
+            NOW,
+            || Some(saved_copy(Harness::ClaudeCode, 30.0, NOW + 5)),
+            || Err(failed(None)),
+        );
+        assert_eq!(reading.snapshot, None);
+    }
+
+    #[test]
+    fn a_saved_reading_stays_saved_in_the_file() {
+        let dir = TempDir::new("cache-saved-file");
+        let copy = saved_copy(Harness::ClaudeCode, 30.0, NOW - 10);
+        cache(&dir).get(
+            Harness::ClaudeCode,
+            NOW,
+            || Some(copy.clone()),
+            || panic!("fetched with a fresh saved reading"),
+        );
+        let reading = cache(&dir).peek(Harness::ClaudeCode).unwrap();
+        assert_eq!(reading.snapshot, Some(copy));
+        assert_eq!(reading.checked_at, NOW - 10);
+    }
+
+    #[test]
     fn without_a_directory_readings_stay_in_memory() {
         let cache = Cache::new(None);
-        cache.get(Harness::Codex, NOW, || Ok(snapshot(10.0, NOW)));
-        cache.get(Harness::Codex, NOW + 10, || panic!("fetched while fresh"));
+        cache.get(Harness::Codex, NOW, || None, || Ok(snapshot(10.0, NOW)));
+        cache.get(
+            Harness::Codex,
+            NOW + 10,
+            || None,
+            || panic!("fetched while fresh"),
+        );
         assert!(cache.peek(Harness::Codex).is_some());
         assert_eq!(cache.peek(Harness::Droid), None);
     }

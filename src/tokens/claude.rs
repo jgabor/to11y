@@ -22,7 +22,7 @@ pub fn files(env: &Env) -> Listing {
     let mut files = Vec::new();
     walk(&root, 6, &is_transcript, &mut files);
     Listing {
-        root: root.is_dir().then_some(root),
+        roots: root.is_dir().then_some(root).into_iter().collect(),
         files,
         unsupported: 0,
     }

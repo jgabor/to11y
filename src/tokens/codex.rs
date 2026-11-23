@@ -41,7 +41,7 @@ pub fn files(env: &Env) -> Listing {
         &mut compressed,
     );
     Listing {
-        root: root.is_dir().then_some(root),
+        roots: root.is_dir().then_some(root).into_iter().collect(),
         files,
         unsupported: compressed.len(),
     }

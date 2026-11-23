@@ -161,36 +161,41 @@ pub fn codex(env: &Env) -> Result<Login, Unavailable> {
     })
 }
 
-/// `~/.factory/auth.v2.keyring`, decrypted with the key Droid keeps in the
-/// system keyring.
+/// Droid's sign-in, from whichever of its two stores it wrote last:
+/// `~/.factory/auth.v2.keyring`, whose key is in the system keyring, or
+/// `auth.v2.file`, whose key is in `auth.v2.key` beside it. When both were
+/// written at once, the keyring store counts. A newer store that can't be
+/// read is a failure, never a reason to use the older one.
 pub fn droid(env: &Env, keyring: &dyn Keyring) -> Result<Login, Unavailable> {
     let dir = env.factory_dir().ok_or(Unavailable::NotInstalled)?;
-    let sealed = match read_capped(&dir.join("auth.v2.keyring")) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            if !dir.is_dir() {
-                return Err(Unavailable::NotInstalled);
-            }
-            if dir.join("auth.v2.file").exists() {
-                return Err(Unavailable::Unsupported(
-                    "Droid keeps its sign-in in a file-backed store, which to11y doesn't read yet."
-                        .to_owned(),
-                ));
-            }
-            return Err(Unavailable::NotSignedIn);
-        }
-        Err(_) => {
-            return Err(Unavailable::Failed(
-                "Droid's stored sign-in couldn't be read.".to_owned(),
-            ));
-        }
+    let modified = |name: &str| {
+        std::fs::metadata(dir.join(name))
+            .and_then(|meta| meta.modified())
+            .ok()
     };
-    let key = keyring
-        .find(&[
-            ("service", "Factory CLI"),
-            ("account", "auth-encryption-key"),
-        ])?
-        .ok_or(Unavailable::NotSignedIn)?;
+    let in_keyring = match (modified("auth.v2.keyring"), modified("auth.v2.file")) {
+        (None, None) if !dir.is_dir() => return Err(Unavailable::NotInstalled),
+        (None, None) => return Err(Unavailable::NotSignedIn),
+        (Some(keyring), Some(file)) => keyring >= file,
+        (keyring, _) => keyring.is_some(),
+    };
+    let unreadable = || Unavailable::Failed("Droid's stored sign-in couldn't be read.".to_owned());
+    let (sealed, key, source) = if in_keyring {
+        let sealed = read_capped(&dir.join("auth.v2.keyring")).map_err(|_| unreadable())?;
+        let key = keyring
+            .find(&[
+                ("service", "Factory CLI"),
+                ("account", "auth-encryption-key"),
+            ])?
+            .ok_or(Unavailable::NotSignedIn)?;
+        (sealed, key, Source::EncryptedFile)
+    } else {
+        let sealed = read_capped(&dir.join("auth.v2.file")).map_err(|_| unreadable())?;
+        let key = read_capped(&dir.join("auth.v2.key")).map_err(|_| {
+            Unavailable::Failed("Droid's stored sign-in has no readable key.".to_owned())
+        })?;
+        (sealed, key, Source::File)
+    };
     let plain = decrypt_factory(&sealed, &key).ok_or_else(|| {
         Unavailable::Failed("Droid's stored sign-in couldn't be decrypted.".to_owned())
     })?;
@@ -206,24 +211,70 @@ pub fn droid(env: &Env, keyring: &dyn Keyring) -> Result<Login, Unavailable> {
         expires_at: jwt_expiry(token),
         plan: None,
         tier: None,
-        source: Source::EncryptedFile,
+        source,
     })
 }
 
-/// The keyring item Antigravity's Go keyring library writes.
+/// Antigravity's sign-in: the keyring item its Go keyring library writes,
+/// or `antigravity-oauth-token` in one of the CLI's folders, which agy uses
+/// when there is no keyring and T3 Code's agy always uses. Of those it can
+/// read, the one that stays good longest counts. A locked keyring is never
+/// passed over, since agy could unlock it with a prompt.
 pub fn antigravity(env: &Env, keyring: &dyn Keyring) -> Result<Login, Unavailable> {
-    let installed =
-        env.antigravity_dir().is_some_and(|dir| dir.is_dir()) || env.find_program("agy").is_some();
-    let Some(raw) = keyring.find(&[("service", "gemini"), ("username", "antigravity")])? else {
-        return Err(if installed {
-            Unavailable::NotSignedIn
-        } else {
-            Unavailable::NotInstalled
-        });
-    };
     let bad = || Unavailable::Failed("Antigravity's stored sign-in couldn't be read.".to_owned());
-    let json: Value =
-        serde_json::from_slice(&strip_go_keyring(&raw).ok_or_else(bad)?).map_err(|_| bad())?;
+    let mut logins = Vec::new();
+    let mut damaged = false;
+    let missing = match keyring.find(&[("service", "gemini"), ("username", "antigravity")]) {
+        Ok(Some(raw)) => {
+            match strip_go_keyring(&raw).map(|json| antigravity_login(&json, Source::Keyring)) {
+                Some(Ok(login)) => logins.push(login),
+                _ => damaged = true,
+            }
+            None
+        }
+        Ok(None) => None,
+        Err(Unavailable::KeyringMissing) => Some(Unavailable::KeyringMissing),
+        Err(other) => return Err(other),
+    };
+    let dirs = env.antigravity_cli_dirs();
+    for dir in &dirs {
+        match read_capped(&dir.join("antigravity-oauth-token")) {
+            Ok(bytes) => match antigravity_login(&bytes, Source::File) {
+                Ok(login) => logins.push(login),
+                Err(_) => damaged = true,
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => damaged = true,
+        }
+    }
+    // An expiry that can't be read counts as the oldest. A tie goes to the
+    // keyring, then to the folders in order.
+    if let Some(login) = logins
+        .into_iter()
+        .rev()
+        .max_by_key(|login| login.expires_at.unwrap_or(i64::MIN))
+    {
+        return Ok(login);
+    }
+    if damaged {
+        return Err(bad());
+    }
+    let installed = env.antigravity_dir().is_some_and(|dir| dir.is_dir())
+        || dirs.iter().any(|dir| dir.is_dir())
+        || env.find_program("agy").is_some();
+    Err(match missing {
+        Some(why) => why,
+        None if installed => Unavailable::NotSignedIn,
+        None => Unavailable::NotInstalled,
+    })
+}
+
+/// `{"token": {"access_token", "expiry"}}`, from the keyring or the file.
+/// Nothing else in it is kept.
+fn antigravity_login(bytes: &[u8], source: Source) -> Result<Login, Unavailable> {
+    let json: Value = serde_json::from_slice(bytes).map_err(|_| {
+        Unavailable::Failed("Antigravity's stored sign-in couldn't be read.".to_owned())
+    })?;
     let token = json["token"]["access_token"]
         .as_str()
         .filter(|token| !token.is_empty())
@@ -236,7 +287,7 @@ pub fn antigravity(env: &Env, keyring: &dyn Keyring) -> Result<Login, Unavailabl
             .and_then(crate::time::parse),
         plan: None,
         tier: None,
-        source: Source::Keyring,
+        source,
     })
 }
 
@@ -471,8 +522,79 @@ mod tests {
         home.write(".factory/auth.v2.file", "x");
         assert!(matches!(
             droid(&home.env(), &keyring),
-            Err(Unavailable::Unsupported(_))
+            Err(Unavailable::Failed(_))
         ));
+    }
+
+    /// Sets the mtime of `relative` under `home`, in Unix seconds.
+    fn touch(home: &Home, relative: &str, at: i64) {
+        crate::tokens::tests::touch(&home.0.path().join(relative), at);
+    }
+
+    #[test]
+    fn a_droid_file_sign_in_is_decrypted_with_the_key_beside_it() {
+        let home = Home::new("droid-file");
+        home.write(".factory/auth.v2.file", FACTORY_FILE)
+            .write(".factory/auth.v2.key", &format!("{FACTORY_KEY}\n"));
+        let login = droid(&home.env(), &MemoryKeyring::default()).unwrap();
+        assert_eq!(login.token.expose(), JWT);
+        assert_eq!(login.source, Source::File);
+        let text = format!("{login:?}");
+        assert!(!text.contains(FACTORY_KEY), "{text}");
+    }
+
+    #[test]
+    fn a_droid_file_sign_in_without_its_key_is_a_failure() {
+        let home = Home::new("droid-no-key");
+        home.write(".factory/auth.v2.file", FACTORY_FILE);
+        let keyring = MemoryKeyring::default().with(&FACTORY, FACTORY_KEY.as_bytes());
+        assert!(matches!(
+            droid(&home.env(), &keyring),
+            Err(Unavailable::Failed(_))
+        ));
+    }
+
+    #[test]
+    fn the_droid_store_written_last_counts() {
+        let home = Home::new("droid-newer");
+        home.write(".factory/auth.v2.keyring", "damaged")
+            .write(".factory/auth.v2.file", FACTORY_FILE)
+            .write(".factory/auth.v2.key", FACTORY_KEY);
+        let keyring = MemoryKeyring::default().with(&FACTORY, FACTORY_KEY.as_bytes());
+        touch(&home, ".factory/auth.v2.keyring", 1_000);
+        touch(&home, ".factory/auth.v2.file", 2_000);
+        assert_eq!(droid(&home.env(), &keyring).unwrap().source, Source::File);
+        // Equal times go to the keyring store, which can't be decrypted.
+        touch(&home, ".factory/auth.v2.keyring", 2_000);
+        assert!(matches!(
+            droid(&home.env(), &keyring),
+            Err(Unavailable::Failed(_))
+        ));
+        home.write(".factory/auth.v2.keyring", FACTORY_FILE)
+            .write(".factory/auth.v2.file", "damaged");
+        touch(&home, ".factory/auth.v2.keyring", 3_000);
+        touch(&home, ".factory/auth.v2.file", 2_000);
+        let login = droid(&home.env(), &keyring).unwrap();
+        assert_eq!(login.source, Source::EncryptedFile);
+    }
+
+    #[test]
+    fn a_locked_keyring_stays_locked_when_an_older_file_store_exists() {
+        let home = Home::new("droid-locked-file");
+        home.write(".factory/auth.v2.keyring", FACTORY_FILE)
+            .write(".factory/auth.v2.file", FACTORY_FILE)
+            .write(".factory/auth.v2.key", FACTORY_KEY);
+        touch(&home, ".factory/auth.v2.file", 1_000);
+        touch(&home, ".factory/auth.v2.keyring", 2_000);
+        let keyring = MemoryKeyring {
+            locked: true,
+            ..MemoryKeyring::default()
+        }
+        .with(&FACTORY, FACTORY_KEY.as_bytes());
+        assert_eq!(
+            droid(&home.env(), &keyring).unwrap_err(),
+            Unavailable::KeyringLocked
+        );
     }
 
     #[test]
@@ -535,6 +657,119 @@ mod tests {
             antigravity(&home.env(), &empty).unwrap_err(),
             Unavailable::NotInstalled
         );
+    }
+
+    const AGY_TOKEN: &str = ".gemini/antigravity-cli/antigravity-oauth-token";
+
+    #[test]
+    fn without_a_keyring_item_antigravity_reads_its_token_file() {
+        let home = Home::new("agy-file");
+        home.write(
+            AGY_TOKEN,
+            r#"{"token":{"access_token":"ya29-file","refresh_token":"secret-refresh","expiry":"2026-11-23T14:31:10Z"}}"#,
+        );
+        for keyring in [
+            MemoryKeyring::default(),
+            MemoryKeyring::default().with(&FACTORY, b"other"),
+        ] {
+            let login = antigravity(&home.env(), &keyring).unwrap();
+            assert_eq!(login.token.expose(), "ya29-file");
+            assert_eq!(login.expires_at, Some(1_795_444_270));
+            assert_eq!(login.source, Source::File);
+            assert!(!format!("{login:?}").contains("secret-refresh"));
+        }
+        let none = SecretService { address: None };
+        assert_eq!(
+            antigravity(&home.env(), &none).unwrap().source,
+            Source::File
+        );
+    }
+
+    fn agy_token(access: &str, expiry: &str) -> String {
+        format!(r#"{{"token":{{"access_token":"{access}","expiry":"{expiry}"}}}}"#)
+    }
+
+    #[test]
+    fn the_antigravity_sign_in_that_stays_good_longest_counts() {
+        let home = Home::new("agy-both");
+        let keyring_item = agy_token("ya29-keyring", "2026-11-23T15:00:00Z");
+        let keyring = MemoryKeyring::default().with(&GEMINI, keyring_item.as_bytes());
+        home.write(AGY_TOKEN, &agy_token("ya29-file", "2026-11-23T15:00:00Z"));
+        let login = antigravity(&home.env(), &keyring).unwrap();
+        assert_eq!(
+            login.token.expose(),
+            "ya29-keyring",
+            "a tie goes to the keyring"
+        );
+        home.write(AGY_TOKEN, &agy_token("ya29-file", "2026-11-23T16:00:00Z"));
+        let login = antigravity(&home.env(), &keyring).unwrap();
+        assert_eq!(login.token.expose(), "ya29-file");
+        assert_eq!(login.source, Source::File);
+    }
+
+    #[test]
+    fn t3_codes_antigravity_sign_in_is_read_through_gemini_home() {
+        let home = Home::new("agy-t3");
+        home.write(AGY_TOKEN, &agy_token("ya29-plain", "2026-11-21T17:40:51Z"))
+            .write(
+                "t3/profile/antigravity-acp/antigravity-oauth-token",
+                &agy_token("ya29-t3", "2026-11-23T22:42:39.129679963+01:00"),
+            );
+        let env = Env {
+            gemini_home: Some(home.0.path().join("t3/profile")),
+            ..home.env()
+        };
+        let none = SecretService { address: None };
+        let login = antigravity(&env, &none).unwrap();
+        assert_eq!(login.token.expose(), "ya29-t3");
+        assert_eq!(login.expires_at, Some(1_795_470_159));
+        // Without GEMINI_HOME, only the plain agy's folders are read.
+        let login = antigravity(&home.env(), &none).unwrap();
+        assert_eq!(login.token.expose(), "ya29-plain");
+    }
+
+    #[test]
+    fn a_damaged_antigravity_file_is_passed_over_for_a_good_one() {
+        let home = Home::new("agy-damaged");
+        home.write(AGY_TOKEN, "{").write(
+            ".gemini/antigravity-acp/antigravity-oauth-token",
+            &agy_token("ya29-acp", "2026-11-23T15:00:00Z"),
+        );
+        let none = SecretService { address: None };
+        assert_eq!(
+            antigravity(&home.env(), &none).unwrap().token.expose(),
+            "ya29-acp"
+        );
+    }
+
+    #[test]
+    fn a_locked_keyring_is_never_passed_over_for_a_file() {
+        let home = Home::new("agy-locked-file");
+        home.write(AGY_TOKEN, &agy_token("ya29-file", "2026-11-23T16:00:00Z"));
+        let locked = MemoryKeyring {
+            locked: true,
+            ..MemoryKeyring::default()
+        }
+        .with(&GEMINI, b"{}");
+        assert_eq!(
+            antigravity(&home.env(), &locked).unwrap_err(),
+            Unavailable::KeyringLocked
+        );
+    }
+
+    #[test]
+    fn without_a_keyring_or_a_token_file_antigravity_says_which() {
+        let home = Home::new("agy-none");
+        let none = SecretService { address: None };
+        assert_eq!(
+            antigravity(&home.env(), &none).unwrap_err(),
+            Unavailable::KeyringMissing
+        );
+        home.write(AGY_TOKEN, "{");
+        assert!(matches!(
+            antigravity(&home.env(), &none),
+            Err(Unavailable::Failed(_))
+        ));
     }
 
     #[test]

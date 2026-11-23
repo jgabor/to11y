@@ -6,6 +6,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -71,6 +72,37 @@ fn direct(cx: &Context, login: &Login, now: i64) -> Result<Snapshot, Failure> {
     Err(last.expect("HOSTS is not empty"))
 }
 
+/// How many `agy` that to11y started are still running.
+static RUNNING_AGY: AtomicUsize = AtomicUsize::new(0);
+
+/// Counts one running `agy` until dropped.
+struct Running;
+
+impl Running {
+    fn start() -> Self {
+        RUNNING_AGY.fetch_add(1, Ordering::SeqCst);
+        Running
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        RUNNING_AGY.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Waits until no `agy` that to11y started is running, for at most agy's
+/// timeout, so a command line run that gave up on agy doesn't exit while
+/// agy renews the sign-in.
+pub fn wait_for_agy() {
+    let started = Instant::now();
+    while RUNNING_AGY.load(Ordering::SeqCst) > 0
+        && started.elapsed() < AGY_TIMEOUT + Duration::from_secs(1)
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// `agy -p /usage --output-format json`, with nothing on its stdin, its
 /// errors dropped, and `dir` as its working directory. Killed after
 /// `timeout`.
@@ -120,6 +152,7 @@ fn run_agy(
     }
     let mut child = attempt
         .map_err(|error| Unavailable::Failed(format!("agy couldn't be started: {error}.")))?;
+    let _running = Running::start();
     let mut stdout = child.stdout.take().expect("stdout is piped");
     let (send, receive) = mpsc::channel();
     std::thread::spawn(move || {
@@ -268,6 +301,7 @@ pub fn parse(body: &Value, now: i64) -> Result<Snapshot, Unavailable> {
         windows,
         credits: None,
         fetched_at: now,
+        origin: crate::model::Origin::Provider,
     })
 }
 
@@ -292,7 +326,7 @@ mod tests {
     );
 
     /// A context whose home, cache, and `PATH` are all inside `dir`.
-    fn context(dir: &TempDir, keyring: MemoryKeyring) -> Context {
+    fn context(dir: &TempDir, keyring: impl crate::creds::Keyring + 'static) -> Context {
         Context {
             env: Arc::new(Env {
                 home: Some(dir.path().join("home")),
@@ -329,6 +363,46 @@ mod tests {
             ),
         );
         let snapshot = fetch(&context(&dir, expired()), NOW).unwrap();
+        assert_eq!(snapshot.windows.len(), 5);
+    }
+
+    #[test]
+    fn a_locked_keyring_never_runs_agy() {
+        let dir = TempDir::new("agy-locked");
+        let marker = dir.path().join("agy-ran");
+        dir.script(
+            "bin/agy",
+            &format!(
+                r#"PATH=/usr/bin:/bin; touch "{}"; exec cat "{AGY_FIXTURE}""#,
+                marker.display()
+            ),
+        );
+        dir.write(
+            "home/.gemini/antigravity-cli/antigravity-oauth-token",
+            r#"{"token":{"access_token":"ya29-file","expiry":"2026-11-23T14:00:00Z"}}"#,
+        );
+        let locked = MemoryKeyring {
+            locked: true,
+            ..expired()
+        };
+        let failure = fetch(&context(&dir, locked), NOW).unwrap_err();
+        assert_eq!(failure.why, Unavailable::KeyringLocked);
+        assert!(!marker.exists(), "agy ran with the keyring locked");
+    }
+
+    #[test]
+    fn an_expired_token_file_without_a_keyring_asks_agy() {
+        let dir = TempDir::new("agy-file-expired");
+        dir.script(
+            "bin/agy",
+            &format!(r#"PATH=/usr/bin:/bin exec cat "{AGY_FIXTURE}""#),
+        );
+        dir.write(
+            "home/.gemini/antigravity-cli/antigravity-oauth-token",
+            r#"{"token":{"access_token":"ya29-file","expiry":"2026-11-23T14:00:00Z"}}"#,
+        );
+        let none = crate::creds::SecretService { address: None };
+        let snapshot = fetch(&context(&dir, none), NOW).unwrap();
         assert_eq!(snapshot.windows.len(), 5);
     }
 
