@@ -76,7 +76,7 @@ pub fn parse(body: &Value, now: i64) -> Result<Snapshot, Unavailable> {
         tier: None,
         windows,
         credits: Some(Credits {
-            enabled: body["extraUsageAllowed"].as_bool(),
+            enabled: extra_usage_on(body),
             balance: balance.map(|cents| Money {
                 amount: cents / 100.0,
                 currency: "USD".to_owned(),
@@ -87,6 +87,19 @@ pub fn parse(body: &Value, now: i64) -> Result<Snapshot, Unavailable> {
         fetched_at: now,
         origin: crate::model::Origin::Provider,
     })
+}
+
+/// Whether extra usage is switched on. `extraUsageAllowed` only says the
+/// account may use it, and is false on a free trial. Droid counts it as on
+/// when the account's `overagePreference` is `extraUsage` and it is allowed.
+/// With no preference to go by, to11y doesn't guess.
+fn extra_usage_on(body: &Value) -> Option<bool> {
+    let allowed = body["extraUsageAllowed"].as_bool();
+    match (body["overagePreference"].as_str(), allowed) {
+        (_, Some(false)) | (Some("droidCore"), _) => Some(false),
+        (Some("extraUsage"), allowed) => allowed,
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -142,10 +155,40 @@ mod tests {
 
     #[test]
     fn the_balance_is_in_dollars() {
-        let body = json!({"limits": {}, "extraUsageBalanceCents": 1250, "extraUsageAllowed": true});
+        let body = json!({"limits": {}, "extraUsageBalanceCents": 1250});
         let credits = parse(&body, NOW).unwrap().credits.unwrap();
         assert_eq!(credits.balance.unwrap().amount, 12.5);
-        assert_eq!(credits.enabled, Some(true));
+    }
+
+    #[test]
+    fn extra_usage_is_on_only_when_it_is_chosen_and_allowed() {
+        // The fixture's account may use extra usage but chose Droid Core.
+        let credits = parse(&fixture(), NOW).unwrap().credits.unwrap();
+        assert_eq!(credits.enabled, Some(false));
+        assert_eq!(credits.note.as_deref(), Some("droidCore"));
+
+        let enabled = |body: Value| parse(&body, NOW).unwrap().credits.unwrap().enabled;
+        assert_eq!(
+            enabled(
+                json!({"limits": {}, "overagePreference": "extraUsage", "extraUsageAllowed": true})
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            enabled(
+                json!({"limits": {}, "overagePreference": "extraUsage", "extraUsageAllowed": false})
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            enabled(json!({"limits": {}, "extraUsageAllowed": false})),
+            Some(false)
+        );
+        // Allowed, but nothing says which way the account chose.
+        assert_eq!(
+            enabled(json!({"limits": {}, "extraUsageAllowed": true})),
+            None
+        );
     }
 
     #[test]
