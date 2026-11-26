@@ -15,6 +15,7 @@ pub struct Sandbox {
     root: PathBuf,
     fixtures: PathBuf,
     claude_session: Option<String>,
+    now: String,
 }
 
 impl Sandbox {
@@ -26,6 +27,7 @@ impl Sandbox {
             root,
             fixtures: PathBuf::from(FIXTURES),
             claude_session: None,
+            now: NOW.to_owned(),
         }
     }
 
@@ -54,6 +56,12 @@ impl Sandbox {
         self
     }
 
+    /// Runs the binary at `now`, an RFC 3339 time, instead of `NOW`.
+    pub fn at(mut self, now: &str) -> Self {
+        self.now = now.to_owned();
+        self
+    }
+
     pub fn fixture(&self, name: &str, text: &str) {
         std::fs::write(self.fixtures.join(name), text).unwrap();
     }
@@ -68,7 +76,7 @@ impl Sandbox {
             ("HOME", self.root.join("home")),
             ("XDG_CACHE_HOME", self.root.join("cache")),
             ("TO11Y_FIXTURES", self.fixtures.clone()),
-            ("TO11Y_NOW", PathBuf::from(NOW)),
+            ("TO11Y_NOW", PathBuf::from(&self.now)),
         ];
         if let Some(session) = &self.claude_session {
             vars.push(("CLAUDE_CODE_SESSION_ID", PathBuf::from(session)));

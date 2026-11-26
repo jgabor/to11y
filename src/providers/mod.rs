@@ -128,17 +128,37 @@ pub fn request(
     match response.status {
         200 => serde_json::from_slice(&response.body)
             .map_err(|_| failed(format!("{provider} sent a usage answer that isn't JSON."))),
+        // Each provider checks the token's expiry before asking, so a 401
+        // is a sign-in the provider refused.
         401 => Err(Failure {
-            why: Unavailable::SignInExpired,
+            why: Unavailable::SignInRefused(format!(
+                "{provider} refused the stored sign-in (HTTP 401)."
+            )),
             retry_after,
         }),
         429 => Err(failed(format!(
             "{provider} is limiting how often usage can be checked (HTTP 429)."
         ))),
-        status => Err(failed(format!(
-            "{provider} answered the usage request with HTTP {status}."
-        ))),
+        status => Err(failed(match error_status(&response.body) {
+            Some(word) => {
+                format!("{provider} answered the usage request with HTTP {status} ({word}).")
+            }
+            None => format!("{provider} answered the usage request with HTTP {status}."),
+        })),
     }
+}
+
+/// The status word of a Google style error body, as in
+/// `{"error": {"status": "PERMISSION_DENIED"}}`. Only a word of capitals
+/// and underscores is kept, so nothing else from the body can get out.
+fn error_status(body: &[u8]) -> Option<String> {
+    let json: Value = serde_json::from_slice(body).ok()?;
+    let word = json["error"]["status"].as_str()?;
+    let first = word.chars().next()?;
+    (first.is_ascii_uppercase()
+        && word.len() <= 64
+        && word.chars().all(|c| c.is_ascii_uppercase() || c == '_'))
+    .then(|| word.to_owned())
 }
 
 /// `<dir>/<harness>.json` parsed as the provider's answer. A missing file
@@ -246,6 +266,7 @@ pub fn window(
 mod tests {
     use super::*;
     use crate::creds::MemoryKeyring;
+    use serde_json::json;
 
     /// The outcome of one request to a localhost server that sends `head`
     /// and `body`.
@@ -272,9 +293,38 @@ mod tests {
     }
 
     #[test]
-    fn a_401_means_the_sign_in_no_longer_works() {
+    fn a_401_is_a_refused_sign_in_and_never_quotes_the_body() {
         let failure = answer("HTTP/1.1 401 Unauthorized", r#"{"error":"token expired"}"#);
-        assert_eq!(failure.unwrap_err().why, Unavailable::SignInExpired);
+        assert_eq!(
+            failure.unwrap_err().why,
+            Unavailable::SignInRefused("OpenAI refused the stored sign-in (HTTP 401).".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_error_names_the_status_word_and_nothing_else_from_the_body() {
+        let body = r#"{"error":{"code":403,"status":"PERMISSION_DENIED","message":"planted"}}"#;
+        let failure = answer("HTTP/1.1 403 Forbidden", body).unwrap_err();
+        assert_eq!(
+            failure.why,
+            Unavailable::Failed(
+                "OpenAI answered the usage request with HTTP 403 (PERMISSION_DENIED).".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn a_status_that_isnt_one_word_of_capitals_is_left_out() {
+        let long = "A".repeat(65);
+        for status in ["user@example.invalid", "Denied", "", long.as_str()] {
+            let body = json!({"error": {"status": status}}).to_string();
+            let failure = answer("HTTP/1.1 403 Forbidden", &body).unwrap_err();
+            assert_eq!(
+                failure.why,
+                Unavailable::Failed("OpenAI answered the usage request with HTTP 403.".to_owned()),
+                "{status}"
+            );
+        }
     }
 
     #[test]

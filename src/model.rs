@@ -202,6 +202,9 @@ pub enum Unavailable {
     NotInstalled,
     NotSignedIn,
     SignInExpired,
+    /// The provider refused a sign-in that hasn't expired, or `agy` couldn't
+    /// renew one. The text names what refused it, never a response body.
+    SignInRefused(String),
     KeyringLocked,
     /// No Secret Service, or no session bus to reach one.
     KeyringMissing,
@@ -216,6 +219,7 @@ impl Unavailable {
             Unavailable::NotInstalled => "not_installed",
             Unavailable::NotSignedIn => "not_signed_in",
             Unavailable::SignInExpired => "sign_in_expired",
+            Unavailable::SignInRefused(_) => "sign_in_refused",
             Unavailable::KeyringLocked => "keyring_locked",
             Unavailable::KeyringMissing => "keyring_missing",
             Unavailable::Unsupported(_) => "unsupported",
@@ -232,6 +236,9 @@ impl Unavailable {
             Unavailable::SignInExpired => format!(
                 "{name}'s stored sign-in has expired. Using {name} renews it; to11y never refreshes logins."
             ),
+            Unavailable::SignInRefused(why) => {
+                format!("{why} Sign in to {name} again; to11y never refreshes logins.")
+            }
             Unavailable::KeyringLocked => {
                 "The system keyring is locked. Unlock it, then ask again.".to_owned()
             }
@@ -244,7 +251,9 @@ impl Unavailable {
 
     pub fn to_json(&self) -> Value {
         match self {
-            Unavailable::Unsupported(why) | Unavailable::Failed(why) => {
+            Unavailable::SignInRefused(why)
+            | Unavailable::Unsupported(why)
+            | Unavailable::Failed(why) => {
                 json!({ "kind": self.kind(), "detail": why })
             }
             _ => json!({ "kind": self.kind() }),
@@ -257,6 +266,7 @@ impl Unavailable {
             "not_installed" => Unavailable::NotInstalled,
             "not_signed_in" => Unavailable::NotSignedIn,
             "sign_in_expired" => Unavailable::SignInExpired,
+            "sign_in_refused" => Unavailable::SignInRefused(detail()),
             "keyring_locked" => Unavailable::KeyringLocked,
             "keyring_missing" => Unavailable::KeyringMissing,
             "unsupported" => Unavailable::Unsupported(detail()),
@@ -448,6 +458,32 @@ mod tests {
         let mut old = snapshot.to_json();
         old.as_object_mut().unwrap().remove("origin");
         assert_eq!(Snapshot::from_json(&old).unwrap().origin, Origin::Provider);
+    }
+
+    #[test]
+    fn every_reason_round_trips_through_json() {
+        for why in [
+            Unavailable::NotInstalled,
+            Unavailable::NotSignedIn,
+            Unavailable::SignInExpired,
+            Unavailable::SignInRefused("Google refused the stored sign-in.".to_owned()),
+            Unavailable::KeyringLocked,
+            Unavailable::KeyringMissing,
+            Unavailable::Unsupported("No usage endpoint.".to_owned()),
+            Unavailable::Failed("HTTP 500.".to_owned()),
+        ] {
+            assert_eq!(Unavailable::from_json(&why.to_json()), Some(why));
+        }
+    }
+
+    #[test]
+    fn a_refused_sign_in_says_what_refused_it_and_how_to_fix_it() {
+        let why =
+            Unavailable::SignInRefused("Google refused the stored sign-in (HTTP 401).".to_owned());
+        assert_eq!(
+            why.message(Harness::Antigravity),
+            "Google refused the stored sign-in (HTTP 401). Sign in to antigravity again; to11y never refreshes logins."
+        );
     }
 
     #[test]

@@ -150,6 +150,63 @@ async fn token_tools_read_the_logs_of_the_calling_session() {
     client.cancel().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_reading_says_its_blocks_are_unknown_and_why() {
+    let sandbox = Sandbox::new("stale").own_fixtures();
+    // A good reading at the fixture time, in which Droid's `core` is blocked.
+    let out = sandbox
+        .std_command()
+        .args(["rate_limit_status", "--harness", "droid"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    sandbox.fixture(
+        "droid.json",
+        r#"{"to11y_unavailable": {"kind": "sign_in_refused", "detail": "Factory refused the stored sign-in (HTTP 401)."}}"#,
+    );
+    let sandbox = sandbox.at("2026-11-24T10:31:10Z");
+    let client = connect(&sandbox, "droid", ClientLifecycleMode::Initialize).await;
+    let result = client
+        .call_tool(call("rate_limit_status", Value::Null))
+        .await
+        .unwrap();
+    assert_eq!(result.is_error, Some(false));
+    let out = text(&result);
+    assert_eq!(out["harness"], "droid");
+    assert_eq!(out["blocked"], "unknown");
+    assert_eq!(out["scopes"][1], json!({"scope": "core", "blocked": null}));
+    assert_eq!(out["stale"]["reason"], "sign_in_refused");
+    assert_eq!(out["last_known"]["age"], "20h");
+    assert_eq!(out["last_known"]["scopes"][1]["blocked"], true);
+
+    let result = client
+        .call_tool(call("usage_limits", Value::Null))
+        .await
+        .unwrap();
+    let out = text(&result);
+    assert!(out.get("windows").is_none(), "{out}");
+    assert!(
+        out["last_known"]["windows"]
+            .as_array()
+            .is_some_and(|w| !w.is_empty())
+    );
+
+    let result = client
+        .call_tool(call("usage_limits_all_harnesses", Value::Null))
+        .await
+        .unwrap();
+    let out = text(&result);
+    let droid = &out["harnesses"][2];
+    assert_eq!(droid["harness"], "droid");
+    assert_eq!(droid["stale"]["reason"], "sign_in_refused");
+    assert_eq!(
+        droid["scopes"][1],
+        json!({"scope": "core", "blocked": null})
+    );
+    assert_eq!(droid["last_known"]["scopes"][1]["blocked"], true);
+    client.cancel().await.unwrap();
+}
+
 /// The binary driven line by line. Every line it writes must be JSON.
 struct Raw {
     child: Child,
