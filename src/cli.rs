@@ -30,8 +30,9 @@ Options for a tool:
   --period P      5h, 24h, 7d, or 30d, for the token tools. Defaults to 24h.
   --pretty        Indent the JSON.
 
-Exit status: 0 for a result, including a stale one, 1 when the result is
-an error, and 2 for a bad command line.
+Exit status: 0 for a current result, 1 when the result is an error, 2 for
+a bad command line, and 3 when to11y couldn't check and the result holds
+the last known reading, under `stale` and `last_known`.
 
 Options:
   -h, --help     Show this help.
@@ -181,6 +182,8 @@ pub fn run(command: Command, mut env: Env) -> ExitCode {
                 .unwrap_or(Value::Null);
             let code = if result["isError"] == true {
                 ExitCode::FAILURE
+            } else if is_stale(&value) {
+                ExitCode::from(STALE)
             } else {
                 ExitCode::SUCCESS
             };
@@ -202,6 +205,17 @@ pub fn run(command: Command, mut env: Env) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The exit status of a result that holds a stale reading.
+const STALE: u8 = 3;
+
+/// Whether the result, or any harness in it, is a stale reading.
+fn is_stale(value: &Value) -> bool {
+    value.get("stale").is_some()
+        || value["harnesses"]
+            .as_array()
+            .is_some_and(|all| all.iter().any(|h| h.get("stale").is_some()))
 }
 
 fn render(value: &Value, pretty: bool) -> String {
@@ -287,6 +301,16 @@ mod tests {
             let error = parse(&args(line)).unwrap_err();
             assert!(error.starts_with(says), "{line}: {error}");
         }
+    }
+
+    #[test]
+    fn a_result_is_stale_when_it_or_any_harness_in_it_is() {
+        assert!(is_stale(&json!({"harness": "codex", "stale": {}})));
+        assert!(is_stale(
+            &json!({"harnesses": [{"harness": "codex"}, {"harness": "droid", "stale": {}}]})
+        ));
+        assert!(!is_stale(&json!({"harness": "codex", "windows": []})));
+        assert!(!is_stale(&json!({"harnesses": [{"harness": "codex"}]})));
     }
 
     #[test]

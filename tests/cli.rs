@@ -51,7 +51,7 @@ fn pretty_output_is_the_same_document_indented() {
 }
 
 #[test]
-fn an_error_result_exits_1_and_a_stale_one_exits_0() {
+fn an_error_result_exits_1_and_a_stale_one_exits_3() {
     let sandbox = Sandbox::new("cli-errors").own_fixtures();
     sandbox.fixture(
         "droid.json",
@@ -66,14 +66,145 @@ fn an_error_result_exits_1_and_a_stale_one_exits_0() {
         "codex.json",
         r#"{"to11y_unavailable": {"kind": "failed", "detail": "HTTP 500."}}"#,
     );
-    let out = sandbox
-        .std_command()
-        .args(["usage_limits", "--harness", "codex"])
-        .env("TO11Y_NOW", "2026-11-23T14:33:10Z")
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(0));
+    let sandbox = sandbox.at("2026-11-23T14:33:10Z");
+    let out = run(&sandbox, &["usage_limits", "--harness", "codex"]);
+    assert_eq!(out.status.code(), Some(3));
     assert_eq!(json_line(&out)["stale"]["reason"], "failed");
+}
+
+/// Twenty hours after the fixtures were captured.
+const LATER: &str = "2026-11-24T10:31:10Z";
+
+/// A sandbox in which Droid's last good reading is from `NOW`, with its
+/// `core` scope blocked, and every check since fails with `why`. It runs at
+/// `LATER`.
+fn stale_droid(name: &str, why: &str) -> Sandbox {
+    let sandbox = Sandbox::new(name).own_fixtures();
+    let out = run(&sandbox, &["rate_limit_status", "--harness", "droid"]);
+    assert_eq!(json_line(&out)["blocked"], "all");
+    let why: Value = serde_json::from_str(why).unwrap();
+    sandbox.fixture(
+        "droid.json",
+        &json!({ "to11y_unavailable": why }).to_string(),
+    );
+    sandbox.at(LATER)
+}
+
+/// The tools that answer from a reading of the provider.
+const LIMIT_TOOLS: [&str; 9] = [
+    "usage_limits",
+    "usage_pace",
+    "usage_forecast",
+    "usage_reset_times",
+    "usage_remaining_quota",
+    "rate_limit_status",
+    "usage_extra_credits",
+    "subscription_plan",
+    "token_usage_limit_windows",
+];
+
+#[test]
+fn every_limit_tool_puts_a_stale_reading_under_last_known() {
+    let sandbox = stale_droid(
+        "cli-stale-all",
+        r#"{"kind": "failed", "detail": "HTTP 500."}"#,
+    );
+    for tool in LIMIT_TOOLS {
+        let out = run(&sandbox, &[tool, "--harness", "droid"]);
+        assert_eq!(out.status.code(), Some(3), "{tool}");
+        let value = json_line(&out);
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        keys.sort_unstable();
+        let expected: &[&str] = if tool == "rate_limit_status" {
+            &["blocked", "harness", "last_known", "scopes", "stale"]
+        } else {
+            &["harness", "last_known", "stale"]
+        };
+        assert_eq!(keys, expected, "{tool}: {value}");
+        assert_eq!(value["stale"]["age"], "20h", "{tool}");
+        assert_eq!(value["stale"]["message"], "HTTP 500.", "{tool}");
+        assert_eq!(value["last_known"]["age"], "20h", "{tool}");
+        assert!(
+            value["last_known"].as_object().unwrap().len() > 1,
+            "{tool}: {value}"
+        );
+    }
+}
+
+#[test]
+fn rate_limit_status_on_a_stale_reading_says_blocks_are_unknown() {
+    let sandbox = stale_droid(
+        "cli-stale-blocked",
+        r#"{"kind": "failed", "detail": "HTTP 500."}"#,
+    );
+    let value = json_line(&run(&sandbox, &["rate_limit_status", "--harness", "droid"]));
+    assert_eq!(value["blocked"], "unknown");
+    assert_eq!(
+        value["scopes"],
+        json!([
+            {"scope": "standard", "blocked": null},
+            {"scope": "core", "blocked": null},
+        ])
+    );
+    // The block on `core` lasts past `LATER`; `standard`'s windows reset.
+    assert_eq!(value["last_known"]["blocked"], "some");
+    assert_eq!(value["last_known"]["scopes"][1]["scope"], "core");
+    assert_eq!(value["last_known"]["scopes"][1]["blocked"], true);
+    assert_eq!(
+        value["last_known"]["scopes"][1]["until"],
+        "2026-11-29T01:13:07Z"
+    );
+    assert_eq!(value["last_known"]["scopes"][0]["blocked"], false);
+}
+
+#[test]
+fn all_harnesses_says_a_stale_harness_has_unknown_blocks() {
+    let sandbox = stale_droid(
+        "cli-stale-harnesses",
+        r#"{"kind": "failed", "detail": "HTTP 500."}"#,
+    );
+    let out = run(&sandbox, &["usage_limits_all_harnesses"]);
+    assert_eq!(out.status.code(), Some(3));
+    let value = json_line(&out);
+    let droid = value["harnesses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["harness"] == "droid")
+        .unwrap();
+    assert_eq!(droid["stale"], json!({"age": "20h", "reason": "failed"}));
+    assert_eq!(
+        droid["scopes"],
+        json!([
+            {"scope": "standard", "blocked": null},
+            {"scope": "core", "blocked": null},
+        ])
+    );
+    assert_eq!(droid["last_known"]["scopes"][1]["blocked"], true);
+    let codex = &value["harnesses"][1];
+    assert_eq!(codex["harness"], "codex");
+    assert!(codex.get("stale").is_none() && codex.get("last_known").is_none());
+}
+
+#[test]
+fn a_refused_sign_in_is_its_own_stale_reason() {
+    let sandbox = stale_droid(
+        "cli-stale-refused",
+        r#"{"kind": "sign_in_refused", "detail": "Factory refused the stored sign-in (HTTP 401)."}"#,
+    );
+    let out = run(&sandbox, &["rate_limit_status", "--harness", "droid"]);
+    assert_eq!(out.status.code(), Some(3));
+    let stale = &json_line(&out)["stale"];
+    assert_eq!(stale["reason"], "sign_in_refused");
+    assert_eq!(
+        stale["message"],
+        "Factory refused the stored sign-in (HTTP 401). Sign in to droid again; to11y never refreshes logins."
+    );
 }
 
 #[test]

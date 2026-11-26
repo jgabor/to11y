@@ -55,6 +55,33 @@ to11y token_usage_recent --harness codex --period 7d --pretty
 Run `to11y tools` to list the tools, and `to11y --help` for options and exit
 codes.
 
+## Stale results
+
+When to11y can't check a harness but has an older reading, a limit tool
+still answers, and its result says so. Read `stale` first:
+
+- Without `stale`, the result is current.
+- With `stale`, the top level holds only `harness` and `stale`. The values
+  from the older reading are under `last_known`, with their `age`, so none
+  of them passes for a current one.
+- `rate_limit_status` also gives `"blocked": "unknown"`, and each scope
+  `"blocked": null`. `usage_limits_all_harnesses` does the same for each
+  stale harness.
+- The command line exits 3.
+
+`stale.reason` says why the check failed:
+
+| Reason | Meaning |
+|---|---|
+| `sign_in_expired` | The sign-in expired. Using the agent renews it. |
+| `sign_in_refused` | Refused, or `agy` couldn't renew it. Sign in again. |
+| `keyring_locked`, `keyring_missing` | The keyring can't be read. |
+| `not_installed`, `not_signed_in` | The agent or its sign-in is gone. |
+| `unsupported` | The account has no limits to11y can read. |
+| `failed` | Anything else, such as a network error. |
+
+`stale.message` is a sentence to pass on to the user.
+
 ## Privacy and caching
 
 to11y uses each agent's existing sign-in and local logs, follows

@@ -32,17 +32,28 @@ const MAX_AGY_BYTES: u64 = 1024 * 1024;
 /// renews the stored sign-in as a side effect.
 pub fn fetch(cx: &Context, now: i64) -> Result<Snapshot, Failure> {
     let login = creds::antigravity(&cx.env, &*cx.keyring)?;
+    let mut refused = None;
     if !login.expires_within(now, 60) {
         match direct(cx, &login, now) {
-            Err(failure) if failure.why == Unavailable::SignInExpired => {}
+            Err(failure) if matches!(failure.why, Unavailable::SignInRefused(_)) => {
+                refused = Some(failure);
+            }
             other => return other,
         }
     }
+    renew(cx, refused, now)
+}
+
+/// The reading from `agy`, which renews the stored sign-in. `refused` is
+/// Google's refusal of the direct call, if there was one. Without agy, the
+/// sign-in stays as Google left it: refused, or else expired.
+fn renew(cx: &Context, refused: Option<Failure>, now: i64) -> Result<Snapshot, Failure> {
+    let cannot_renew = || refused.unwrap_or_else(|| Unavailable::SignInExpired.into());
     if cx.env.no_agy {
-        return Err(Unavailable::SignInExpired.into());
+        return Err(cannot_renew());
     }
     let (Some(program), Some(dir)) = (cx.env.find_program("agy"), cx.env.cache_dir()) else {
-        return Err(Unavailable::SignInExpired.into());
+        return Err(cannot_renew());
     };
     crate::cache::make_dir(&dir).map_err(|_| {
         Unavailable::Failed("to11y couldn't create its cache directory.".to_owned())
@@ -65,7 +76,9 @@ fn direct(cx: &Context, login: &Login, now: i64) -> Result<Snapshot, Failure> {
         let url = format!("https://{host}/v1internal:retrieveUserQuotaSummary");
         match request(cx, Harness::Antigravity, &url, &headers, Some(b"{}")) {
             Ok(body) => return Ok(parse(&body, now)?),
-            Err(failure) if failure.why == Unavailable::SignInExpired => return Err(failure),
+            Err(failure) if matches!(failure.why, Unavailable::SignInRefused(_)) => {
+                return Err(failure);
+            }
             Err(failure) => last = Some(failure),
         }
     }
@@ -106,6 +119,10 @@ pub fn wait_for_agy() {
 /// `agy -p /usage --output-format json`, with nothing on its stdin, its
 /// errors dropped, and `dir` as its working directory. Killed after
 /// `timeout`.
+///
+/// agy runs only when the stored sign-in has expired or was refused, so an
+/// agy that fails or doesn't answer couldn't renew it. An agy that can't be
+/// started never tried.
 ///
 /// It can't update itself or open a browser: a sign-in that can't renew
 /// silently would otherwise open one. `path` is the `PATH` to give it,
@@ -162,8 +179,8 @@ fn run_agy(
     });
     let started = Instant::now();
     let too_slow = || {
-        Unavailable::Failed(format!(
-            "agy didn't answer within {} seconds.",
+        Unavailable::SignInRefused(format!(
+            "agy couldn't renew the stored sign-in: it didn't answer within {} seconds.",
             timeout.as_secs()
         ))
     };
@@ -181,14 +198,19 @@ fn run_agy(
         }
     };
     if !status.success() {
-        return Err(Unavailable::Failed(format!("agy failed with {status}.")));
+        return Err(Unavailable::SignInRefused(format!(
+            "agy couldn't renew the stored sign-in: it failed with {status}."
+        )));
     }
     // A process agy left behind could hold its output open, so the wait
     // for the rest of it is bounded too.
     let left = timeout
         .saturating_sub(started.elapsed())
         .max(Duration::from_secs(1));
-    receive.recv_timeout(left).map_err(|_| too_slow())
+    // agy exited 0 here, so the sign-in may well have renewed.
+    receive
+        .recv_timeout(left)
+        .map_err(|_| Unavailable::Failed("agy exited but its output didn't finish.".to_owned()))
 }
 
 /// The folder, inside the cache, whose `xdg-open` always fails.
@@ -418,33 +440,73 @@ mod tests {
     }
 
     #[test]
-    fn an_agy_that_hangs_is_killed_at_the_timeout() {
+    fn an_agy_that_hangs_is_killed_and_the_sign_in_wasnt_renewed() {
         let dir = TempDir::new("agy-hang");
         let program = dir.script("bin/agy", "exec sleep 5");
         let started = Instant::now();
         let path = std::env::var_os("PATH");
         let timeout = Duration::from_millis(300);
         let error = run_agy(&program, dir.path(), path.as_deref(), timeout).unwrap_err();
-        assert!(matches!(error, Unavailable::Failed(_)));
+        assert!(matches!(error, Unavailable::SignInRefused(_)), "{error:?}");
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
-    fn an_agy_that_fails_is_a_failure() {
+    fn an_agy_that_fails_couldnt_renew_the_sign_in() {
         let dir = TempDir::new("agy-fails");
         let program = dir.script("bin/agy", "echo '{}'; exit 4");
         let path = std::env::var_os("PATH");
         let error = run_agy(&program, dir.path(), path.as_deref(), AGY_TIMEOUT).unwrap_err();
         assert_eq!(
             error,
-            Unavailable::Failed("agy failed with exit status: 4.".to_owned())
+            Unavailable::SignInRefused(
+                "agy couldn't renew the stored sign-in: it failed with exit status: 4.".to_owned()
+            )
         );
+    }
+
+    #[test]
+    fn an_agy_that_cant_be_started_never_tried_to_renew() {
+        let dir = TempDir::new("agy-unstartable");
+        let missing = dir.path().join("bin/agy");
+        let error = run_agy(&missing, dir.path(), None, AGY_TIMEOUT).unwrap_err();
+        assert!(matches!(error, Unavailable::Failed(_)), "{error:?}");
+    }
+
+    #[test]
+    fn an_agy_answer_that_isnt_json_is_a_failure_not_a_refusal() {
+        let dir = TempDir::new("agy-not-json");
+        dir.script("bin/agy", "echo not json");
+        let failure = fetch(&context(&dir, expired()), NOW).unwrap_err();
+        assert!(matches!(failure.why, Unavailable::Failed(_)), "{failure:?}");
+    }
+
+    #[test]
+    fn without_agy_a_refused_sign_in_stays_refused() {
+        let dir = TempDir::new("agy-missing-refused");
+        let why =
+            Unavailable::SignInRefused("Google refused the stored sign-in (HTTP 401).".to_owned());
+        let failure = renew(&context(&dir, expired()), Some(why.clone().into()), NOW).unwrap_err();
+        assert_eq!(failure.why, why);
+    }
+
+    #[test]
+    fn a_refused_sign_in_is_renewed_by_agy_when_there_is_one() {
+        let dir = TempDir::new("agy-renews-refused");
+        dir.script(
+            "bin/agy",
+            &format!(r#"PATH=/usr/bin:/bin exec cat "{AGY_FIXTURE}""#),
+        );
+        let why =
+            Unavailable::SignInRefused("Google refused the stored sign-in (HTTP 401).".to_owned());
+        let snapshot = renew(&context(&dir, expired()), Some(why.into()), NOW).unwrap();
+        assert_eq!(snapshot.windows.len(), 5);
     }
 
     #[test]
     fn a_harness_that_takes_too_long_is_given_up_on() {
         let dir = TempDir::new("agy-deadline");
-        dir.script("bin/agy", "exec sleep 5");
+        dir.script("bin/agy", "PATH=/usr/bin:/bin exec sleep 5");
         let cx = context(&dir, expired());
         let started = Instant::now();
         let failure = crate::providers::fetch_within(
@@ -454,7 +516,10 @@ mod tests {
             Duration::from_millis(200),
         )
         .unwrap_err();
-        assert!(matches!(failure.why, Unavailable::Failed(_)));
+        assert_eq!(
+            failure.why,
+            Unavailable::Failed("Google didn't answer within 0 seconds.".to_owned())
+        );
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 

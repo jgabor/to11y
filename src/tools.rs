@@ -273,23 +273,15 @@ impl Tools {
             return unavailable(harness, &why);
         };
         let (assessed, scopes) = pace::assess(&snapshot.windows, now);
-        let mut out = Map::new();
-        out.insert("harness".to_owned(), json!(harness.name()));
-        if let Some(why) = &reading.failure {
-            out.insert(
-                "stale".to_owned(),
-                json!({
-                    "age": time::duration(now - snapshot.fetched_at),
-                    "reason": why.kind(),
-                    "message": why.message(harness),
-                }),
-            );
-        }
+        let age = time::duration(now - snapshot.fetched_at);
+        // What the reading says. Current, it is the result; stale, it goes
+        // under `last_known`, so no old value passes for a current one.
+        let mut body = Map::new();
         if snapshot.origin == Origin::Saved {
-            out.insert(
+            body.insert(
                 "saved_copy".to_owned(),
                 json!({
-                    "age": time::duration(now - snapshot.fetched_at),
+                    "age": age,
                     "message": format!(
                         "This is the reading {} saved, not one to11y asked {} for.",
                         harness.name(),
@@ -298,36 +290,57 @@ impl Tools {
                 }),
             );
         }
-        if name == "token_usage_limit_windows" {
-            out.extend(report::limit_windows(harness, env, now, snapshot));
-            return result(Value::Object(out), false);
-        }
         let windows = |f: &dyn Fn(&Assessed) -> Value| -> Value {
             assessed.iter().map(f).collect::<Vec<_>>().into()
         };
         match name {
             "usage_limits" => {
-                put(&mut out, "plan", json!(snapshot.plan));
-                out.insert("windows".to_owned(), windows(&limit));
+                put(&mut body, "plan", json!(snapshot.plan));
+                body.insert("windows".to_owned(), windows(&limit));
             }
             "usage_pace" => {
-                out.insert("baseline".to_owned(), json!("even use over each window"));
-                out.insert("windows".to_owned(), windows(&pacing));
+                body.insert("baseline".to_owned(), json!("even use over each window"));
+                body.insert("windows".to_owned(), windows(&pacing));
             }
             "usage_forecast" => {
-                out.insert("windows".to_owned(), windows(&|a| forecast(a, now)));
+                body.insert("windows".to_owned(), windows(&|a| forecast(a, now)));
             }
             "usage_reset_times" => {
-                out.insert("windows".to_owned(), windows(&reset));
+                body.insert("windows".to_owned(), windows(&reset));
             }
             "usage_remaining_quota" => {
-                out.insert("windows".to_owned(), windows(&remaining));
-                out.insert("scopes".to_owned(), tightest(&assessed, &scopes));
+                body.insert("windows".to_owned(), windows(&remaining));
+                body.insert("scopes".to_owned(), tightest(&assessed, &scopes));
             }
-            "rate_limit_status" => blocked(&mut out, &scopes, now),
-            "usage_extra_credits" => credits(&mut out, snapshot),
-            "subscription_plan" => plan(&mut out, harness, snapshot),
+            "rate_limit_status" => blocked(&mut body, &scopes, now),
+            "usage_extra_credits" => credits(&mut body, snapshot),
+            "subscription_plan" => plan(&mut body, harness, snapshot),
+            "token_usage_limit_windows" => {
+                let mut windows = report::limit_windows(harness, env, now, snapshot);
+                windows.remove("harness");
+                body.extend(windows);
+            }
             _ => return failure(&format!("Unknown tool: {name}")),
+        }
+        let mut out = Map::new();
+        out.insert("harness".to_owned(), json!(harness.name()));
+        match &reading.failure {
+            None => out.extend(body),
+            Some(why) => {
+                out.insert(
+                    "stale".to_owned(),
+                    json!({
+                        "age": age,
+                        "reason": why.kind(),
+                        "message": why.message(harness),
+                    }),
+                );
+                if name == "rate_limit_status" {
+                    out.insert("blocked".to_owned(), json!("unknown"));
+                    out.insert("scopes".to_owned(), unknown(&scopes));
+                }
+                out.insert("last_known".to_owned(), last_known(age, body));
+            }
         }
         result(Value::Object(out), false)
     }
@@ -378,24 +391,28 @@ impl Tools {
                         out.insert("unavailable".to_owned(), json!(why.kind()));
                     }
                     (Some(snapshot), why) => {
-                        if let Some(why) = why {
-                            out.insert(
-                                "stale".to_owned(),
-                                json!({ "age": time::duration(now - snapshot.fetched_at), "reason": why.kind() }),
-                            );
-                        }
+                        let age = time::duration(now - snapshot.fetched_at);
+                        let mut body = Map::new();
                         if snapshot.origin == Origin::Saved {
-                            out.insert(
-                                "saved_copy".to_owned(),
-                                json!({ "age": time::duration(now - snapshot.fetched_at) }),
-                            );
+                            body.insert("saved_copy".to_owned(), json!({ "age": age }));
                         }
                         let (assessed, scopes) = pace::assess(&snapshot.windows, now);
                         let rows: Vec<Value> = scopes
                             .iter()
                             .map(|scope| summary(&assessed, scope, now))
                             .collect();
-                        out.insert("scopes".to_owned(), rows.into());
+                        body.insert("scopes".to_owned(), rows.into());
+                        match why {
+                            None => out.extend(body),
+                            Some(why) => {
+                                out.insert(
+                                    "stale".to_owned(),
+                                    json!({ "age": age, "reason": why.kind() }),
+                                );
+                                out.insert("scopes".to_owned(), unknown(&scopes));
+                                out.insert("last_known".to_owned(), last_known(age, body));
+                            }
+                        }
                     }
                 }
                 Value::Object(out)
@@ -754,6 +771,23 @@ fn plan(out: &mut Map<String, Value>, harness: Harness, snapshot: &Snapshot) {
     }
 }
 
+/// Each scope of a stale reading, whose block can't be known.
+fn unknown(scopes: &[Scope]) -> Value {
+    scopes
+        .iter()
+        .map(|scope| json!({ "scope": scope.name, "blocked": null }))
+        .collect::<Vec<_>>()
+        .into()
+}
+
+/// What a stale reading said, `age` ago.
+fn last_known(age: String, body: Map<String, Value>) -> Value {
+    let mut last = Map::new();
+    last.insert("age".to_owned(), json!(age));
+    last.extend(body);
+    Value::Object(last)
+}
+
 /// One scope in the all-harnesses comparison: blocked until when, or its
 /// tightest window.
 fn summary(assessed: &[Assessed], scope: &Scope, now: i64) -> Value {
@@ -969,11 +1003,20 @@ mod tests {
         });
         let (out, error) = call(&tools, "usage_limits", json!({"harness": "claude-code"}));
         assert!(!error, "{out}");
-        assert_eq!(out["saved_copy"]["age"], "10m");
         assert_eq!(out["stale"]["reason"], "failed");
-        assert!(out["windows"].as_array().is_some_and(|w| !w.is_empty()));
+        assert_eq!(out["last_known"]["age"], "10m");
+        assert_eq!(out["last_known"]["saved_copy"]["age"], "10m");
+        assert!(
+            out["last_known"]["windows"]
+                .as_array()
+                .is_some_and(|w| !w.is_empty())
+        );
+        assert!(out.get("windows").is_none() && out.get("saved_copy").is_none());
         let (all, _) = call(&tools, "usage_limits_all_harnesses", Value::Null);
-        assert_eq!(all["harnesses"][0]["saved_copy"]["age"], "10m");
+        assert_eq!(
+            all["harnesses"][0]["last_known"]["saved_copy"]["age"],
+            "10m"
+        );
         let (status, _) = call(
             &tools,
             "usage_login_status",
